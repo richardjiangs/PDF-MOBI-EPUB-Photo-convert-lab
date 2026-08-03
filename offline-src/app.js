@@ -7,8 +7,7 @@ import { initMobiFile, initKf8File } from "@lingo-reader/mobi-parser";
 const $ = (s, root = document) => root.querySelector(s);
 const $$ = (s, root = document) => [...root.querySelectorAll(s)];
 const enc = new TextEncoder();
-const dec = new TextDecoder();
-const state = { photos: [], pdfFile: null, pdfBytes: null, pdf: null, pdfPending: null, pdfPassword: "", bookFile: null, book: null, bookPending: null, bookPassword: "" };
+const state = { photos: [], pdfFile: null, pdfBytes: null, pdf: null, pdfPending: null, pdfPassword: "", pdfBlankness: new Map(), bookFile: null, book: null, bookPending: null, bookPassword: "" };
 const workerSource = $("#pdf-worker-source").textContent;
 pdfjsLib.GlobalWorkerOptions.workerSrc = URL.createObjectURL(new Blob([workerSource], { type: "text/javascript" }));
 
@@ -94,11 +93,7 @@ function parseRange(input, max, blankMeansAll = false) {
   return [...found].sort((a, b) => a - b);
 }
 
-// Navigation and dropzones
-$$('.tab').forEach(button => button.addEventListener('click', () => {
-  $$('.tab').forEach(x => x.classList.toggle('active', x === button));
-  $$('.panel').forEach(x => x.classList.toggle('active', x.id === `panel-${button.dataset.tab}`));
-}));
+// Dropzones
 function wireDrop(zone, input, handler) {
   ["dragenter", "dragover"].forEach(name => zone.addEventListener(name, e => { e.preventDefault(); zone.classList.add("drag"); }));
   ["dragleave", "drop"].forEach(name => zone.addEventListener(name, e => { e.preventDefault(); zone.classList.remove("drag"); }));
@@ -196,10 +191,11 @@ async function loadPdf(file, password = "", existingBytes = null) {
   try {
     status(password ? "Unlocking PDF locally" : "Reading PDF locally", 8); const bytes = existingBytes || new Uint8Array(await file.arrayBuffer());
     const task = pdfjsLib.getDocument({ data: bytes.slice(), password: password || undefined }); const pdf = await task.promise;
-    state.pdfFile = file; state.pdfBytes = bytes; state.pdf = pdf; state.pdfPending = null; state.pdfPassword = password;
+    state.pdfFile = file; state.pdfBytes = bytes; state.pdf = pdf; state.pdfPending = null; state.pdfPassword = password; state.pdfBlankness.clear();
     $("#pdf-password-box").classList.remove("show"); $("#pdf-password").value = "";
     $("#pdf-drop").style.display = "none"; $("#pdf-queue").classList.add("show"); $("#pdf-count").textContent = `${pdf.numPages} pages · ${formatBytes(file.size)}`;
-    $("#pdf-to-images").disabled = false; $("#pdf-delete").disabled = false; renderPdfPlaceholders(); status("PDF ready", 100, true);
+    ["#pdf-to-images", "#pdf-delete", "#pdf-analyze", "#pdf-threshold-uncheck", "#pdf-auto-blank", "#pdf-delete-unchecked"].forEach(id => $(id).disabled = false);
+    renderPdfPlaceholders(); status("PDF ready · every page is kept until you untick it", 100, true);
   } catch (e) {
     if (isPasswordError(e)) {
       const bytes = existingBytes || new Uint8Array(await file.arrayBuffer()); state.pdfPending = { file, bytes }; state.pdfFile = file;
@@ -214,18 +210,23 @@ $("#pdf-password").addEventListener("keydown", e => { if (e.key === "Enter") $("
 $("#pdf-reset").addEventListener("click", () => {
   thumbObserver?.disconnect();
   state.pdf?.destroy?.();
-  state.pdfFile = state.pdfBytes = state.pdf = state.pdfPending = null; state.pdfPassword = "";
+  state.pdfFile = state.pdfBytes = state.pdf = state.pdfPending = null; state.pdfPassword = ""; state.pdfBlankness.clear();
   $("#pdf-pages").textContent = "";
   $("#pdf-queue").classList.remove("show");
   $("#pdf-drop").style.display = "flex";
   $("#pdf-password-box").classList.remove("show"); $("#pdf-password").value = "";
-  $("#pdf-to-images").disabled = $("#pdf-delete").disabled = true;
+  ["#pdf-to-images", "#pdf-delete", "#pdf-analyze", "#pdf-threshold-uncheck", "#pdf-auto-blank", "#pdf-delete-unchecked"].forEach(id => $(id).disabled = true);
 });
 let thumbObserver;
 function renderPdfPlaceholders() {
   const host = $("#pdf-pages"); host.textContent = ""; thumbObserver?.disconnect();
   thumbObserver = new IntersectionObserver(entries => entries.filter(x => x.isIntersecting).forEach(x => { thumbObserver.unobserve(x.target); renderPdfThumb(x.target); }), { rootMargin: "500px" });
-  for (let n = 1; n <= state.pdf.numPages; n++) { const card = document.createElement("div"); card.className = "card"; card.dataset.page = n; card.innerHTML = `<div class="thumb"><span class="page-no">PAGE ${n}</span></div><div class="card-meta"><span class="filename">Page ${n}</span><span class="page-no">PDF</span></div>`; host.append(card); thumbObserver.observe(card); }
+  for (let n = 1; n <= state.pdf.numPages; n++) {
+    const card = document.createElement("div"); card.className = "card"; card.dataset.page = n;
+    card.innerHTML = `<div class="thumb"><span class="page-no">PAGE ${n}</span></div><div class="card-meta"><span class="filename">Page ${n}</span><span class="page-no">PDF</span></div><label class="page-keep"><input class="page-keep-check" type="checkbox" checked aria-label="Keep page ${n}"><span>Keep page</span></label><div class="blank-score">Not analyzed</div>`;
+    $(".page-keep-check", card).addEventListener("change", e => card.classList.toggle("page-removed", !e.target.checked));
+    host.append(card); thumbObserver.observe(card);
+  }
 }
 async function renderPdfThumb(card) {
   try { const page = await state.pdf.getPage(+card.dataset.page); const base = page.getViewport({ scale: 1 }); const scale = 180 / base.width; const viewport = page.getViewport({ scale }); const canvas = document.createElement("canvas"); canvas.width = Math.ceil(viewport.width); canvas.height = Math.ceil(viewport.height); await page.render({ canvasContext: canvas.getContext("2d"), viewport, canvas }).promise; $(".thumb", card).replaceChildren(canvas); page.cleanup(); } catch {}
@@ -245,6 +246,38 @@ async function flattenPdfPages(pdf, keep) {
   }
   return out.save({ useObjectStreams: true });
 }
+async function getPageBlankness(pageNo) {
+  if (state.pdfBlankness.has(pageNo)) return state.pdfBlankness.get(pageNo);
+  const page = await state.pdf.getPage(pageNo), base = page.getViewport({ scale: 1 }), scale = Math.min(.45, 420 / Math.max(base.width, base.height)), viewport = page.getViewport({ scale });
+  const canvas = document.createElement("canvas"); canvas.width = Math.max(1, Math.ceil(viewport.width)); canvas.height = Math.max(1, Math.ceil(viewport.height));
+  const ctx = canvas.getContext("2d", { alpha: false }); ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, canvas.width, canvas.height); await page.render({ canvasContext: ctx, viewport, canvas }).promise; page.cleanup();
+  const pixels = ctx.getImageData(0, 0, canvas.width, canvas.height).data; let blank = 0, total = 0;
+  for (let i = 0; i < pixels.length; i += 16) { total++; if (pixels[i + 3] < 12 || (pixels[i] >= 245 && pixels[i + 1] >= 245 && pixels[i + 2] >= 245)) blank++; }
+  const score = total ? blank / total * 100 : 100; state.pdfBlankness.set(pageNo, score);
+  const label = $(`.card[data-page="${pageNo}"] .blank-score`, $("#pdf-pages")); if (label) label.textContent = `${score.toFixed(1)}% blank`;
+  return score;
+}
+async function analyzePdfBlankness() {
+  if (!state.pdf) throw new Error("Choose a PDF first.");
+  const scores = [];
+  for (let pageNo = 1; pageNo <= state.pdf.numPages; pageNo++) { status(`Analyzing blank space · page ${pageNo} of ${state.pdf.numPages}`, 5 + pageNo / state.pdf.numPages * 90); scores.push(await getPageBlankness(pageNo)); await tick(); }
+  status("Blank-space analysis complete", 100, true); return scores;
+}
+function setPageKept(pageNo, kept) {
+  const card = $(`.card[data-page="${pageNo}"]`, $("#pdf-pages")), check = card && $(".page-keep-check", card); if (!check) return;
+  check.checked = kept; card.classList.toggle("page-removed", !kept);
+}
+function uncheckedPdfPages() { return new Set($$(".card", $("#pdf-pages")).filter(card => !$(".page-keep-check", card).checked).map(card => +card.dataset.page)); }
+async function downloadPdfWithDeleted(deleted) {
+  if (!deleted.size) throw new Error("No pages are marked for deletion. Enter a range or untick one or more page cards.");
+  if (deleted.size === state.pdf.numPages) throw new Error("A PDF needs at least one page. Keep one or more pages.");
+  status("Rebuilding PDF without the marked pages", 25); const keep = Array.from({ length: state.pdf.numPages }, (_, i) => i + 1).filter(n => !deleted.has(n)); let bytes, flattened = false;
+  try {
+    if (state.pdfPassword) throw new Error("Protected document requires flattening");
+    const src = await PDFDocument.load(state.pdfBytes.slice(), { ignoreEncryption: false }), out = await PDFDocument.create(), copied = await out.copyPages(src, keep.map(n => n - 1)); copied.forEach(p => out.addPage(p)); bytes = await out.save({ useObjectStreams: true });
+  } catch { bytes = await flattenPdfPages(state.pdf, keep); flattened = true; }
+  const stem = safeName(state.pdfFile.name.replace(/\.pdf$/i, "")); downloadBlob(bytesToBlob(bytes, "application/pdf"), `${stem}-pages-removed.pdf`); status(`${deleted.size} page${deleted.size === 1 ? "" : "s"} removed${flattened ? " · secured PDF flattened" : ""}`, 100, true);
+}
 $("#pdf-to-images").addEventListener("click", async () => {
   try {
     const pages = parseRange($("#pdf-export-range").value, state.pdf.numPages, true), type = $("#pdf-image-format").value, scale = +$("#pdf-scale").value, streamFolder = $("#pdf-photo-save").value === "auto" && canStreamFolder() && pages.length > 1;
@@ -261,18 +294,21 @@ $("#pdf-to-images").addEventListener("click", async () => {
   } catch (e) { if (e?.name === "AbortError") status("Save canceled", 100, true); else fail(e); }
 });
 $("#pdf-delete").addEventListener("click", async () => {
+  try { await downloadPdfWithDeleted(new Set(parseRange($("#pdf-delete-range").value, state.pdf.numPages))); } catch (e) { fail(e); }
+});
+$("#pdf-analyze").addEventListener("click", () => analyzePdfBlankness().catch(fail));
+$("#pdf-threshold-uncheck").addEventListener("click", async () => {
   try {
-    const deleted = new Set(parseRange($("#pdf-delete-range").value, state.pdf.numPages)); if (!deleted.size) throw new Error("Enter at least one page to delete."); if (deleted.size === state.pdf.numPages) throw new Error("A PDF needs at least one page. Keep one or more pages.");
-    status("Rebuilding PDF without those pages", 25); const keep = Array.from({ length: state.pdf.numPages }, (_, i) => i + 1).filter(n => !deleted.has(n)); let bytes, flattened = false;
-    try {
-      if (state.pdfPassword) throw new Error("Protected document requires flattening");
-      const src = await PDFDocument.load(state.pdfBytes.slice(), { ignoreEncryption: false }), out = await PDFDocument.create(), copied = await out.copyPages(src, keep.map(n => n - 1)); copied.forEach(p => out.addPage(p)); bytes = await out.save({ useObjectStreams: true });
-    } catch { bytes = await flattenPdfPages(state.pdf, keep); flattened = true; }
-    const stem = safeName(state.pdfFile.name.replace(/\.pdf$/i, "")); downloadBlob(bytesToBlob(bytes, "application/pdf"), `${stem}-pages-removed.pdf`); status(`${deleted.size} page${deleted.size === 1 ? "" : "s"} removed${flattened ? " · secured PDF flattened" : ""}`, 100, true);
+    const threshold = +$("#pdf-blank-threshold").value; if (!Number.isFinite(threshold) || threshold < 0 || threshold > 100) throw new Error("Blank threshold must be between 0 and 100%.");
+    const scores = await analyzePdfBlankness(); scores.forEach((score, i) => setPageKept(i + 1, score < threshold)); status(`Pages at least ${threshold}% blank are unticked · review the page cards`, 100, true);
   } catch (e) { fail(e); }
 });
+$("#pdf-auto-blank").addEventListener("click", async () => {
+  try { const scores = await analyzePdfBlankness(), deleted = new Set(scores.map((score, i) => score >= 99.5 ? i + 1 : 0).filter(Boolean)); await downloadPdfWithDeleted(deleted); } catch (e) { fail(e); }
+});
+$("#pdf-delete-unchecked").addEventListener("click", async () => { try { await downloadPdfWithDeleted(uncheckedPdfPages()); } catch (e) { fail(e); } });
 
-// EPUB / MOBI / PDF lab
+// EPUB / MOBI / PDF conversion
 wireDrop($("#book-drop"), $("#book-input"), files => loadBook(files[0]));
 async function loadBook(file, password = "") {
   if (!file || !/\.(epub|mobi|azw3?|azm3|pdf)$/i.test(file.name)) return fail(new Error("Choose a PDF, EPUB, MOBI, AZW, AZW3, or AZM3 file."));
@@ -318,7 +354,6 @@ async function inlineCssResources(css, cssPath, zip, assets) {
   }
   return out + css.slice(at);
 }
-function firstSrcset(value = "") { return value.split(",").map(x => x.trim().split(/\s+/)[0]).find(Boolean) || ""; }
 async function inlineEpubChapter(html, chapterPath, zip, assets) {
   const doc = new DOMParser().parseFromString(html, "text/html");
   for (const source of $$("source[srcset]", doc)) {
@@ -382,11 +417,12 @@ async function pdfAsBook(file, renderPages = true, password = "", existingBytes 
   const bytes = existingBytes || new Uint8Array(await file.arrayBuffer()), pdf = await pdfjsLib.getDocument({ data: bytes.slice(), password: password || undefined }).promise; const book = { sourceType: "pdf", title: file.name.replace(/\.pdf$/i, ""), author: "", pageCount: pdf.numPages, pdf, chapters: [], bytes, password, assets: [] };
   if (renderPages) for (let i = 1; i <= pdf.numPages; i++) {
     status(`Extracting text and artwork from PDF page ${i} of ${pdf.numPages}`, 8 + (i / pdf.numPages) * 80);
-    const page = await pdf.getPage(i), content = await page.getTextContent(), lines = []; let line = [];
+    const page = await pdf.getPage(i), content = await page.getTextContent(), operators = await page.getOperatorList(), lines = []; let line = [];
     for (const item of content.items || []) { const value = String(item.str || "").trim(); if (value) line.push(value); if (item.hasEOL && line.length) { lines.push(line.join(" ")); line = []; } }
-    if (line.length) lines.push(line.join(" ")); page.cleanup();
+    if (line.length) lines.push(line.join(" "));
+    const imageOps = new Set([pdfjsLib.OPS.paintImageXObject, pdfjsLib.OPS.paintJpegXObject, pdfjsLib.OPS.paintInlineImageXObject, pdfjsLib.OPS.paintImageMaskXObject].filter(Number.isFinite)), hasRasterArt = operators.fnArray.some(op => imageOps.has(op)), pageKind = hasRasterArt ? "content" : lines.length ? "text-only" : "blank"; page.cleanup();
     const blob = await renderPdfPage(pdf, i, 1.45, "jpeg", .88), data = await blobToDataURL(blob), textHtml = lines.length ? `<div class="pdf-page-text">${lines.map(value => `<p>${escapeHtml(value)}</p>`).join("")}</div>` : "";
-    book.assets.push(data); book.chapters.push({ title: `Page ${i}`, html: `${textHtml}<div class="pdf-page-art" style="text-align:center"><img alt="Rendered PDF page ${i}" src="${data}"></div>` }); await tick();
+    if (hasRasterArt) book.assets.push(data); book.chapters.push({ title: `Page ${i}`, html: `${textHtml}<div class="pdf-page-art" style="text-align:center"><img data-page-render="${pageKind}" alt="Rendered PDF page ${i}" src="${data}"></div>` }); await tick();
   }
   return book;
 }
@@ -395,16 +431,22 @@ function filterHtml(html, mode) {
   const doc = new DOMParser().parseFromString(html, "text/html");
   if (mode === "text") { $$('img,picture,svg,image,canvas,video,audio,object,embed', doc).forEach(x => x.remove()); $$('[style*="background"]', doc).forEach(x => x.style.backgroundImage = "none"); }
   else {
+    $$("img[data-page-render='text-only'],img[data-page-render='blank']", doc).forEach(x => x.remove());
     const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT); const texts = []; while (walker.nextNode()) texts.push(walker.currentNode); texts.forEach(x => x.textContent = "");
     const media = "img,picture,svg,image,canvas,video,[style*='data:image']"; [...doc.body.querySelectorAll("*")].reverse().forEach(x => { if (!x.matches(media) && !x.querySelector(media) && !["STYLE","SOURCE"].includes(x.tagName)) x.remove(); });
   }
   return $$("style", doc.head).map(x => x.outerHTML).join("") + doc.body.innerHTML;
 }
-function dataImagesIn(html) { return new Set(html.match(/data:image\/[^\s"'()<>]+/gi) || []); }
-function hasVisualContent(html) { const doc = new DOMParser().parseFromString(html, "text/html"); return !!doc.querySelector("img,picture,svg,image,canvas,video,[style*='data:image']") || /data:image\//i.test(html); }
+function dataImagesIn(html) {
+  const doc = new DOMParser().parseFromString(html, "text/html"), found = new Set();
+  for (const node of $$("img[src],image[href],video[poster],[style*='data:image']", doc.body)) for (const value of [node.getAttribute("src"), node.getAttribute("href"), node.getAttribute("poster"), node.getAttribute("style")]) for (const data of value?.match(/data:image\/[^\s"'()<>]+/gi) || []) found.add(data);
+  return found;
+}
+function hasVisualContent(html) { const doc = new DOMParser().parseFromString(html, "text/html"); return !!doc.body.querySelector("img,picture,svg,image,canvas,video,[style*='data:image']") || /data:image\//i.test(doc.body.innerHTML); }
 function hasTextContent(html) { const doc = new DOMParser().parseFromString(html, "text/html"); return !!doc.body.textContent.trim(); }
 function filteredBook(book, mode) {
-  const chapters = book.chapters.map(ch => ({ ...ch, html: filterHtml(ch.html, mode) }));
+  let chapters = book.chapters.map(ch => ({ ...ch, html: filterHtml(ch.html, mode) }));
+  chapters = chapters.filter(ch => mode === "images" ? hasVisualContent(ch.html) : mode === "text" ? hasTextContent(ch.html) : hasTextContent(ch.html) || hasVisualContent(ch.html));
   if (mode === "images") {
     const present = new Set(chapters.flatMap(ch => [...dataImagesIn(ch.html)])), missing = (book.assets || []).filter(asset => !present.has(asset));
     if (missing.length) chapters.push({ title: "Recovered artwork", html: missing.map((src, i) => `<div style="text-align:center;margin:0 0 24px"><img alt="Recovered artwork ${i + 1}" src="${src}"></div>`).join("") });
@@ -418,6 +460,7 @@ $("#book-convert").addEventListener("click", async () => {
     let book = state.book; if (book.sourceType === "pdf" && !book.chapters.length) book = await pdfAsBook(state.bookFile, true, book.password || state.bookPassword, book.bytes);
     const title = safeName($("#book-name").value, book.title || "pageforge-book"), author = $("#book-author").value.trim(), mode = $("#book-filter").value, output = $("#book-output").value;
     const filtered = { ...filteredBook(book, mode), title, author };
+    if (!filtered.chapters.length) throw new Error("No non-empty sections remain after applying that filter.");
     if (mode === "images" && !filtered.chapters.some(ch => hasVisualContent(ch.html))) throw new Error("No visual assets were found after checking covers, SVGs, responsive images, and CSS backgrounds.");
     if (mode === "text" && !filtered.chapters.some(ch => hasTextContent(ch.html))) throw new Error("No extractable text was found. This book may contain scanned page images only; choose Photos only instead.");
     if (output === "pdf") downloadBlob(await bookToPdf(filtered), `${title}.pdf`);
@@ -453,11 +496,10 @@ async function makePrintPages(chapter, index) {
   return pages;
 }
 async function bookToPdf(book) {
-  const pdf = await PDFDocument.create(); let done = 0; const total = book.chapters.length;
+  const pdf = await PDFDocument.create(); const total = book.chapters.length;
   for (let i = 0; i < total; i++) {
     status(`Typesetting section ${i + 1} of ${total}`, (i / total) * 88); const pages = await makePrintPages(book.chapters[i], i); await tick();
     for (const element of pages) { const canvas = await html2canvas(element, { backgroundColor: "#ffffff", scale: 1.35, logging: false, useCORS: false, imageTimeout: 0 }); const jpg = dataUrlToBytes(canvas.toDataURL("image/jpeg", .9)).bytes; const image = await pdf.embedJpg(jpg); const page = pdf.addPage([595.28, 841.89]); page.drawImage(image, { x: 0, y: 0, width: 595.28, height: 841.89 }); element.remove(); }
-    done++;
   }
   if (!pdf.getPageCount()) pdf.addPage([595.28, 841.89]); status("Finalizing PDF", 94); return bytesToBlob(await pdf.save({ useObjectStreams: true }), "application/pdf");
 }

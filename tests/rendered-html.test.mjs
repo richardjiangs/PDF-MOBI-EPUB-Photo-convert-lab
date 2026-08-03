@@ -18,27 +18,33 @@ test("server-renders the PageForge preview wrapper", async () => {
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
   const html = await response.text();
-  assert.match(html, /<title>PageForge Local<\/title>/i);
+  assert.match(html, /<title>PageForge Local 2\.0<\/title>/i);
   assert.match(html, /<iframe[^>]+src="\/PageForge-Website\.html"/i);
   assert.match(html, /PageForge Local preview/i);
 });
 
 test("ships separate standalone and website editions", async () => {
-  const [output, served, website, publicWebsite, hostedWebsite, source] = await Promise.all([
+  const [output, versionedOutput, served, website, publicWebsite, hostedWebsite, source] = await Promise.all([
     readFile(new URL("../outputs/PageForge.html", import.meta.url), "utf8"),
+    readFile(new URL("../outputs/PageForge-Local%202.0.html", import.meta.url), "utf8"),
     readFile(new URL("../public/PageForge.html", import.meta.url), "utf8"),
     readFile(new URL("../index.html", import.meta.url), "utf8"),
     readFile(new URL("../public/index.html", import.meta.url), "utf8"),
     readFile(new URL("../public/PageForge-Website.html", import.meta.url), "utf8"),
     readFile(new URL("../offline-src/app.js", import.meta.url), "utf8"),
   ]);
+  assert.equal(versionedOutput, output);
   assert.equal(served, output);
   assert.equal(publicWebsite, website);
   assert.equal(hostedWebsite, website);
   assert.match(output, /PAGEFORGE LOCAL/);
+  assert.match(output, /PAGEFORGE LOCAL 2\.0/);
   assert.match(output, /id="photo-input"[^>]+multiple/i);
   assert.match(output, /id="pdf-password"/i);
   assert.match(output, /id="book-password"/i);
+  assert.match(output, /id="pdf-blank-threshold"[^>]+value="70"/i);
+  assert.match(output, /id="pdf-delete-unchecked"/i);
+  assert.doesNotMatch(output, /class="tabs"/i);
   assert.match(output, /value="azw3"/i);
   assert.match(output, /value="azm3"/i);
   assert.match(output, /Richard Jiang/);
@@ -51,6 +57,9 @@ test("ships separate standalone and website editions", async () => {
   assert.match(source, /Inventory every packaged image/);
   assert.match(source, /Incorrect password/);
   assert.match(source, /function buildAzw3/);
+  assert.match(source, /chapters = chapters\.filter/);
+  assert.match(source, /async function analyzePdfBlankness/);
+  assert.match(source, /data-page-render/);
   assert.match(source, /initKf8File/);
   assert.doesNotMatch(output, /<(?:script|img|link|iframe)[^>]+(?:src|href)=["']https?:\/\//i);
 });
