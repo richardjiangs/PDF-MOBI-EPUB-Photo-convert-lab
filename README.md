@@ -1,4 +1,4 @@
-# PageForge Local 2.1
+# PageForge Local 2.2
 
 PageForge is a private, browser-based PDF, ebook, and photo conversion studio. Conversion happens on the device: files are not uploaded to a server and the converter does not require an account or external API.
 
@@ -11,7 +11,7 @@ PageForge is a private, browser-based PDF, ebook, and photo conversion studio. C
 - Text + photos, text-only, and photos-only ebook editions; sections that become empty are removed automatically.
 - Password entry for protected PDFs. Publisher DRM is not removed.
 
-Photos, PDFs, EPUBs, MOBIs, and AZW3 books all enter through one upload box; PageForge shows only the applicable choices. Blankness and similarity analysis mark proposed PDF removals in red and wait for explicit confirmation. Confirmation prepares a cleaned result without auto-downloading; the user then chooses PDF, EPUB, MOBI, AZW3, AZM3, JPEG, PNG, or WebP. `PageForge-Local 2.1.html` is the versioned standalone offline file and intentionally omits the support section. `index.html` is the website edition and includes Richard Jiang’s GitHub link and the optional Bitcoin support panel.
+Photos, PDFs, EPUBs, MOBIs, and AZW3 books all enter through one upload box. PDFs use one Download-as selector for PDF, EPUB, MOBI, AZW3, AZM3, JPEG, PNG, and WebP. PDF cleanup proposals are color coded: blue reference, green range, purple blank + similar, and red for other marked pages. Confirmation prepares a cleaned result without auto-downloading. `PageForge-Local 2.2.html` is the versioned standalone offline file and intentionally omits the support section. `index.html` is the website edition and includes Richard Jiang’s GitHub link and the optional Bitcoin support panel.
 
 ## Run locally
 

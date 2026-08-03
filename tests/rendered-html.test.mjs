@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { calculateBlankPercentage } from "../offline-src/blankness.mjs";
-import { calculateFingerprintSimilarity } from "../offline-src/similarity.mjs";
+import { calculateFingerprintSimilarity, matchesBlankAndSimilar } from "../offline-src/similarity.mjs";
 
 test("blank-page analysis returns exact percentages for threshold marking", () => {
   const pixels = new Uint8ClampedArray(10 * 4);
@@ -10,6 +10,12 @@ test("blank-page analysis returns exact percentages for threshold marking", () =
   assert.equal(calculateBlankPercentage(pixels), 70);
   pixels.fill(255);
   assert.equal(calculateBlankPercentage(pixels), 100);
+});
+
+test("purple candidates must pass both blankness and similarity thresholds", () => {
+  assert.equal(matchesBlankAndSimilar(70, 70, 96, 96), true);
+  assert.equal(matchesBlankAndSimilar(69.9, 70, 99, 96), false);
+  assert.equal(matchesBlankAndSimilar(90, 70, 95.9, 96), false);
 });
 
 test("page fingerprint similarity distinguishes matching and different pages", () => {
@@ -37,7 +43,7 @@ test("server-renders the PageForge preview wrapper", async () => {
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
   const html = await response.text();
-  assert.match(html, /<title>PageForge Local 2\.1<\/title>/i);
+  assert.match(html, /<title>PageForge Local 2\.2<\/title>/i);
   assert.match(html, /<iframe[^>]+src="\/PageForge-Website\.html"/i);
   assert.match(html, /PageForge Local preview/i);
 });
@@ -45,7 +51,7 @@ test("server-renders the PageForge preview wrapper", async () => {
 test("ships separate standalone and website editions", async () => {
   const [output, versionedOutput, served, website, publicWebsite, hostedWebsite, githubPages, source, template] = await Promise.all([
     readFile(new URL("../outputs/PageForge.html", import.meta.url), "utf8"),
-    readFile(new URL("../outputs/PageForge-Local%202.1.html", import.meta.url), "utf8"),
+    readFile(new URL("../outputs/PageForge-Local%202.2.html", import.meta.url), "utf8"),
     readFile(new URL("../public/PageForge.html", import.meta.url), "utf8"),
     readFile(new URL("../index.html", import.meta.url), "utf8"),
     readFile(new URL("../public/index.html", import.meta.url), "utf8"),
@@ -60,7 +66,7 @@ test("ships separate standalone and website editions", async () => {
   assert.equal(hostedWebsite, website);
   assert.equal(githubPages, website);
   assert.match(output, /PAGEFORGE LOCAL/);
-  assert.match(output, /PAGEFORGE LOCAL 2\.1/);
+  assert.match(output, /PAGEFORGE LOCAL 2\.2/);
   assert.match(output, /id="unified-input"[^>]+multiple/i);
   assert.match(output, /Drop photos, a PDF, or an ebook here/i);
   assert.doesNotMatch(output, /id="(?:photo|pdf|book)-drop"/i);
@@ -72,8 +78,14 @@ test("ships separate standalone and website editions", async () => {
   assert.match(output, /id="pdf-find-similar"/i);
   assert.match(output, /id="pdf-result-format"/i);
   assert.match(output, /id="pdf-result-photo-quality"/i);
-  assert.match(output, /PDF → EPUB · MOBI · AZW3 · AZM3/i);
-  assert.match(output, /Analyze &amp; mark matching pages|Analyze & mark matching pages/i);
+  assert.match(output, /id="pdf-direct-format"/i);
+  assert.match(output, /id="pdf-direct-download"/i);
+  assert.match(output, /Download as selected format/i);
+  assert.match(output, /Mark range in green/i);
+  assert.match(output, /blank \+ similar/i);
+  assert.doesNotMatch(output, /Go to PDF format conversion/i);
+  assert.doesNotMatch(output, /id="pdf-jump-convert"/i);
+  assert.match(output, /Find blank or blank \+ similar pages/i);
   assert.match(output, /Confirm &amp; prepare cleaned result|Confirm & prepare cleaned result/i);
   assert.doesNotMatch(output, /class="tabs"/i);
   assert.match(output, /value="azw3"/i);
@@ -92,8 +104,11 @@ test("ships separate standalone and website editions", async () => {
   assert.match(source, /async function analyzePdfBlankness/);
   assert.match(source, /calculateFingerprintSimilarity/);
   assert.match(source, /async function preparePdfWithDeleted/);
+  assert.match(source, /async function markPdfBlankCandidates/);
+  assert.match(source, /"combined"/);
+  assert.match(source, /"range"/);
   assert.doesNotMatch(source, /downloadPdfWithDeleted/);
-  assert.match(source, /marked in red · confirm before deletion/);
+  assert.doesNotMatch(source, /pdf-jump-convert/);
   assert.match(source, /function handleUnifiedFiles/);
   assert.match(source, /data-page-render/);
   assert.match(source, /initKf8File/);

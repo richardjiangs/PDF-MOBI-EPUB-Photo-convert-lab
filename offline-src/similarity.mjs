@@ -6,3 +6,7 @@ export function calculateFingerprintSimilarity(first, second) {
   // pixel differences while leaving exact and near-exact repeats near 100%.
   return Math.max(0, Math.min(100, 100 - (difference / (first.length * 255)) * 350));
 }
+
+export function matchesBlankAndSimilar(blankPercentage, blankThreshold, similarityPercentage, similarityThreshold) {
+  return blankPercentage >= blankThreshold && similarityPercentage >= similarityThreshold;
+}
