@@ -4,7 +4,7 @@ import test from "node:test";
 import { calculateBlankPercentage } from "../offline-src/blankness.mjs";
 import { calculateFingerprintSimilarity, matchesBlankAndSimilar } from "../offline-src/similarity.mjs";
 import { buildPdfFromKeptPages } from "../offline-src/pdf-pages.mjs";
-import { chapterNavigationLabel, createPdfBookChapter, wrapKf8Chapter, wrapMobiChapter } from "../offline-src/book-content.mjs";
+import { buildVisibleTableOfContents, chapterNavigationLabel, composeLegacyBookBody, createPdfBookChapter, detectChapterTitle, finalizePdfBookChapters, tableOfContentsEntries, wrapKf8Chapter, wrapMobiChapter } from "../offline-src/book-content.mjs";
 import { PDFDocument } from "pdf-lib";
 
 test("blank-page analysis returns exact percentages for threshold marking", () => {
@@ -55,6 +55,43 @@ test("PDF book conversion never duplicates extracted text and a page image", () 
   assert.equal(chapterNavigationLabel(image, 1), "Page 2");
 
   assert.equal(createPdfBookChapter({ pageNo: 3, lines: [], hasVisualArt: false }), null);
+});
+
+test("offline chapter recognition builds concise navigation without changing chapter bodies", () => {
+  assert.equal(detectChapterTitle([
+    { text: "Chapter XII — A New Road", fontSize: 18 },
+    { text: "This is the opening paragraph of the chapter.", fontSize: 11 },
+  ]), "Chapter XII — A New Road");
+  assert.equal(detectChapterTitle([
+    { text: "A Quiet Beginning", fontSize: 20 },
+    { text: "Ordinary body copy continues here.", fontSize: 11 },
+    { text: "More ordinary body copy.", fontSize: 11 },
+  ]), "A Quiet Beginning");
+  assert.equal(detectChapterTitle([{ text: "Ordinary body copy ends here.", fontSize: 11 }]), "");
+  assert.equal(detectChapterTitle([{ text: "Contents", fontSize: 24 }, { text: "Chapter 1 ........ 3", fontSize: 11 }]), "");
+
+  const chapters = finalizePdfBookChapters([
+    createPdfBookChapter({ pageNo: 1, lines: [{ text: "Chapter 1 — Start", fontSize: 20 }, { text: "Body one.", fontSize: 11 }] }),
+    createPdfBookChapter({ pageNo: 2, lines: [{ text: "Body two.", fontSize: 11 }] }),
+    createPdfBookChapter({ pageNo: 3, lines: [{ text: "Chapter 2 — Next", fontSize: 20 }, { text: "Body three.", fontSize: 11 }] }),
+  ]);
+  assert.deepEqual(tableOfContentsEntries(chapters).map(entry => entry.label), ["Chapter 1 — Start", "Chapter 2 — Next"]);
+  const toc = buildVisibleTableOfContents(chapters);
+  assert.match(toc, /href="#pf-chapter-1"[^>]*>Chapter 1 — Start/);
+  assert.match(toc, /href="#pf-chapter-3"[^>]*>Chapter 2 — Next/);
+  assert.doesNotMatch(chapters[0].html, /<h[1-6]\b|Contents/);
+
+  const fallback = finalizePdfBookChapters([
+    createPdfBookChapter({ pageNo: 4, lines: ["Plain text."] }),
+    createPdfBookChapter({ pageNo: 5, lines: ["More plain text."] }),
+  ]);
+  assert.deepEqual(tableOfContentsEntries(fallback).map(entry => entry.label), ["Page 4", "Page 5"]);
+  const legacy = composeLegacyBookBody({ chapters, sections: ["FIRST BODY", "SECOND BODY"], separator: "<mbp:pagebreak/>" });
+  assert.match(legacy, /^<nav class="pageforge-toc">/);
+  assert.match(legacy, /Contents[\s\S]*FIRST BODY<mbp:pagebreak\/>SECOND BODY/);
+  const photosOnly = composeLegacyBookBody({ chapters, sections: ["<img src='art.jpg'>"], filterMode: "images", separator: "<mbp:pagebreak/>" });
+  assert.equal(photosOnly, "<img src='art.jpg'>");
+  assert.doesNotMatch(photosOnly, /Contents|Chapter|Page \d+/i);
 });
 
 test("ebook writers do not inject visible page or section headings", () => {
@@ -119,6 +156,10 @@ test("ships separate standalone and website editions", async () => {
   assert.match(output, /id="pdf-result-photo-quality"/i);
   assert.match(output, /id="pdf-direct-format"/i);
   assert.match(output, /id="pdf-direct-download"/i);
+  assert.match(output, /id="pdf-direct-author"/i);
+  assert.match(output, /id="pdf-result-author"/i);
+  assert.match(output, /recognize chapter headings offline/i);
+  assert.match(output, /Chapter names are recognized on this device/i);
   assert.match(output, /Download as selected format/i);
   assert.match(output, /Mark range in green/i);
   assert.match(output, /blank \+ similar/i);
@@ -153,6 +194,11 @@ test("ships separate standalone and website editions", async () => {
   assert.match(source, /function handleUnifiedFiles/);
   assert.match(source, /data-page-render/);
   assert.match(source, /createPdfBookChapter/);
+  assert.match(source, /finalizePdfBookChapters/);
+  assert.match(source, /tableOfContentsEntries/);
+  assert.match(source, /composeLegacyBookBody/);
+  assert.match(source, /pdf\.setAuthor\(book\.author\)/);
+  assert.match(source, /generatedBook\.author = author/);
   assert.match(source, /wrapMobiChapter/);
   assert.match(source, /wrapKf8Chapter/);
   assert.doesNotMatch(source, /sections\.push\(`<h2>/);
