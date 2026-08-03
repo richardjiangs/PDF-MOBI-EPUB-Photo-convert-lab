@@ -16,6 +16,10 @@ export function chapterNavigationLabel(chapter, index) {
   return cleanChapterTitle(chapter?.title) || cleanChapterTitle(chapter?.navLabel) || `Section ${index + 1}`;
 }
 
+export function removeBookPages(chapters = [], deletedPages = new Set()) {
+  return chapters.filter((_, index) => !deletedPages.has(index + 1));
+}
+
 function normalizedLine(line) {
   if (typeof line === "string") return { text: cleanChapterTitle(line), fontSize: 0 };
   return {
