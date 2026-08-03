@@ -3,6 +3,7 @@ import * as pdfjsLib from "pdfjs-dist/build/pdf.mjs";
 import JSZip from "jszip";
 import html2canvas from "html2canvas";
 import { initMobiFile, initKf8File } from "@lingo-reader/mobi-parser";
+import { calculateBlankPercentage } from "./blankness.mjs";
 
 const $ = (s, root = document) => root.querySelector(s);
 const $$ = (s, root = document) => [...root.querySelectorAll(s)];
@@ -100,12 +101,32 @@ function wireDrop(zone, input, handler) {
   zone.addEventListener("drop", e => handler([...e.dataTransfer.files]));
   input.addEventListener("change", e => { handler([...e.target.files]); input.value = ""; });
 }
+function showWorkspaceMode(mode) {
+  $("#unified-drop").style.display = "none"; $("#job-intro").style.display = "none";
+  $("#photo-tools").classList.toggle("active", mode === "photos");
+  $("#pdf-tools").classList.toggle("active", mode === "pdf");
+  $("#book-tools").classList.toggle("active", mode === "book" || mode === "pdf");
+}
+function resetWorkspaceDisplay() {
+  $("#unified-drop").style.display = "flex"; $("#job-intro").style.display = "flex";
+  $$(".context-tools").forEach(section => section.classList.remove("active"));
+}
+function handleUnifiedFiles(files) {
+  if (!files.length) return;
+  const images = files.filter(file => file.type.startsWith("image/") || /\.(jpe?g|png|webp|gif|bmp)$/i.test(file.name));
+  if (images.length === files.length) return addPhotos(images);
+  if (files.length !== 1) return fail(new Error("Choose either a set of photos or one PDF/ebook file at a time."));
+  if (/\.pdf$/i.test(files[0].name) || files[0].type === "application/pdf") return loadPdf(files[0]);
+  if (/\.(epub|mobi|azw3?|azm3)$/i.test(files[0].name)) return loadBook(files[0]);
+  fail(new Error("Choose photos, PDF, EPUB, MOBI, AZW, AZW3, or AZM3."));
+}
+wireDrop($("#unified-drop"), $("#unified-input"), handleUnifiedFiles);
 
 // Photos → PDF
-wireDrop($("#photo-drop"), $("#photo-input"), addPhotos);
 function addPhotos(files) {
   const incoming = files.filter(f => f.type.startsWith("image/") || /\.(jpe?g|png|webp|gif|bmp)$/i.test(f.name));
   if (!incoming.length) return fail(new Error("Choose image files such as JPEG, PNG, WebP, GIF, or BMP."));
+  showWorkspaceMode("photos");
   for (const file of incoming) state.photos.push({ id: crypto.randomUUID(), file, url: URL.createObjectURL(file), rotation: 0 });
   renderPhotos();
 }
@@ -128,7 +149,7 @@ function renderPhotos() {
 $("#photo-clear").addEventListener("click", () => {
   state.photos.forEach(x => URL.revokeObjectURL(x.url));
   state.photos = [];
-  renderPhotos();
+  renderPhotos(); resetWorkspaceDisplay();
 });
 async function imageToJpeg(photo, quality) {
   const bitmap = await createImageBitmap(photo.file, { imageOrientation: "from-image" });
@@ -185,37 +206,41 @@ $("#photos-convert").addEventListener("click", async () => {
 });
 
 // PDF workshop
-wireDrop($("#pdf-drop"), $("#pdf-input"), files => loadPdf(files[0]));
 async function loadPdf(file, password = "", existingBytes = null) {
   if (!file || !(/\.pdf$/i.test(file.name) || file.type === "application/pdf")) return fail(new Error("Choose a PDF file."));
   try {
+    showWorkspaceMode("pdf");
     status(password ? "Unlocking PDF locally" : "Reading PDF locally", 8); const bytes = existingBytes || new Uint8Array(await file.arrayBuffer());
     const task = pdfjsLib.getDocument({ data: bytes.slice(), password: password || undefined }); const pdf = await task.promise;
     state.pdfFile = file; state.pdfBytes = bytes; state.pdf = pdf; state.pdfPending = null; state.pdfPassword = password; state.pdfBlankness.clear();
     $("#pdf-password-box").classList.remove("show"); $("#pdf-password").value = "";
-    $("#pdf-drop").style.display = "none"; $("#pdf-queue").classList.add("show"); $("#pdf-count").textContent = `${pdf.numPages} pages · ${formatBytes(file.size)}`;
-    ["#pdf-to-images", "#pdf-delete", "#pdf-analyze", "#pdf-threshold-uncheck", "#pdf-auto-blank", "#pdf-delete-unchecked"].forEach(id => $(id).disabled = false);
+    $("#pdf-queue").classList.add("show"); $("#pdf-count").textContent = `${pdf.numPages} pages · ${formatBytes(file.size)}`;
+    ["#pdf-to-images", "#pdf-delete", "#pdf-analyze", "#pdf-auto-blank"].forEach(id => $(id).disabled = false); $("#pdf-delete-unchecked").disabled = true;
+    stagePdfForBook(file, pdf, bytes, password);
     renderPdfPlaceholders(); status("PDF ready · every page is kept until you untick it", 100, true);
   } catch (e) {
     if (isPasswordError(e)) {
       const bytes = existingBytes || new Uint8Array(await file.arrayBuffer()); state.pdfPending = { file, bytes }; state.pdfFile = file;
-      $("#pdf-drop").style.display = "none"; $("#pdf-queue").classList.add("show"); $("#pdf-pages").textContent = ""; $("#pdf-count").textContent = `Locked · ${file.name}`; $("#pdf-password-box").classList.add("show");
+      showWorkspaceMode("pdf"); $("#pdf-queue").classList.add("show"); $("#pdf-pages").textContent = ""; $("#pdf-count").textContent = `Locked · ${file.name}`; $("#pdf-password-box").classList.add("show");
+      state.bookFile = file; state.book = null; $("#book-summary").classList.add("show"); $("#book-title").textContent = file.name; $("#book-meta").textContent = "Locked PDF · unlock above before converting"; $("#book-type").textContent = "LOCKED"; $("#book-convert").disabled = true;
       status(password ? "Incorrect password — try again" : "Password required", 100, true); setTimeout(() => $("#pdf-password").focus(), 50); return;
     }
-    fail(new Error(`Could not open PDF: ${e.message}`));
+    resetWorkspaceDisplay(); fail(new Error(`Could not open PDF: ${e.message}`));
   }
 }
 $("#pdf-unlock").addEventListener("click", () => { if (state.pdfPending) loadPdf(state.pdfPending.file, $("#pdf-password").value, state.pdfPending.bytes); });
 $("#pdf-password").addEventListener("keydown", e => { if (e.key === "Enter") $("#pdf-unlock").click(); });
 $("#pdf-reset").addEventListener("click", () => {
+  const resetBookToo = state.book?.sourceType === "pdf" || state.bookFile === state.pdfFile;
   thumbObserver?.disconnect();
   state.pdf?.destroy?.();
   state.pdfFile = state.pdfBytes = state.pdf = state.pdfPending = null; state.pdfPassword = ""; state.pdfBlankness.clear();
   $("#pdf-pages").textContent = "";
   $("#pdf-queue").classList.remove("show");
-  $("#pdf-drop").style.display = "flex";
   $("#pdf-password-box").classList.remove("show"); $("#pdf-password").value = "";
-  ["#pdf-to-images", "#pdf-delete", "#pdf-analyze", "#pdf-threshold-uncheck", "#pdf-auto-blank", "#pdf-delete-unchecked"].forEach(id => $(id).disabled = true);
+  ["#pdf-to-images", "#pdf-delete", "#pdf-analyze", "#pdf-auto-blank", "#pdf-delete-unchecked"].forEach(id => $(id).disabled = true);
+  if (resetBookToo) { state.bookFile = state.book = state.bookPending = null; $("#book-summary").classList.remove("show"); $("#book-convert").disabled = true; }
+  resetWorkspaceDisplay();
 });
 let thumbObserver;
 function renderPdfPlaceholders() {
@@ -224,7 +249,7 @@ function renderPdfPlaceholders() {
   for (let n = 1; n <= state.pdf.numPages; n++) {
     const card = document.createElement("div"); card.className = "card"; card.dataset.page = n;
     card.innerHTML = `<div class="thumb"><span class="page-no">PAGE ${n}</span></div><div class="card-meta"><span class="filename">Page ${n}</span><span class="page-no">PDF</span></div><label class="page-keep"><input class="page-keep-check" type="checkbox" checked aria-label="Keep page ${n}"><span>Keep page</span></label><div class="blank-score">Not analyzed</div>`;
-    $(".page-keep-check", card).addEventListener("change", e => card.classList.toggle("page-removed", !e.target.checked));
+    $(".page-keep-check", card).addEventListener("change", e => { card.classList.toggle("page-removed", !e.target.checked); updatePdfConfirmation(); });
     host.append(card); thumbObserver.observe(card);
   }
 }
@@ -251,9 +276,7 @@ async function getPageBlankness(pageNo) {
   const page = await state.pdf.getPage(pageNo), base = page.getViewport({ scale: 1 }), scale = Math.min(.45, 420 / Math.max(base.width, base.height)), viewport = page.getViewport({ scale });
   const canvas = document.createElement("canvas"); canvas.width = Math.max(1, Math.ceil(viewport.width)); canvas.height = Math.max(1, Math.ceil(viewport.height));
   const ctx = canvas.getContext("2d", { alpha: false }); ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, canvas.width, canvas.height); await page.render({ canvasContext: ctx, viewport, canvas }).promise; page.cleanup();
-  const pixels = ctx.getImageData(0, 0, canvas.width, canvas.height).data; let blank = 0, total = 0;
-  for (let i = 0; i < pixels.length; i += 16) { total++; if (pixels[i + 3] < 12 || (pixels[i] >= 245 && pixels[i + 1] >= 245 && pixels[i + 2] >= 245)) blank++; }
-  const score = total ? blank / total * 100 : 100; state.pdfBlankness.set(pageNo, score);
+  const pixels = ctx.getImageData(0, 0, canvas.width, canvas.height).data, score = calculateBlankPercentage(pixels); state.pdfBlankness.set(pageNo, score);
   const label = $(`.card[data-page="${pageNo}"] .blank-score`, $("#pdf-pages")); if (label) label.textContent = `${score.toFixed(1)}% blank`;
   return score;
 }
@@ -268,6 +291,10 @@ function setPageKept(pageNo, kept) {
   check.checked = kept; card.classList.toggle("page-removed", !kept);
 }
 function uncheckedPdfPages() { return new Set($$(".card", $("#pdf-pages")).filter(card => !$(".page-keep-check", card).checked).map(card => +card.dataset.page)); }
+function updatePdfConfirmation() {
+  const count = uncheckedPdfPages().size, button = $("#pdf-delete-unchecked"); button.disabled = count === 0;
+  button.textContent = count ? `Confirm deletion of ${count} marked page${count === 1 ? "" : "s"}` : "Confirm deletion of marked pages";
+}
 async function downloadPdfWithDeleted(deleted) {
   if (!deleted.size) throw new Error("No pages are marked for deletion. Enter a range or untick one or more page cards.");
   if (deleted.size === state.pdf.numPages) throw new Error("A PDF needs at least one page. Keep one or more pages.");
@@ -296,49 +323,59 @@ $("#pdf-to-images").addEventListener("click", async () => {
 $("#pdf-delete").addEventListener("click", async () => {
   try { await downloadPdfWithDeleted(new Set(parseRange($("#pdf-delete-range").value, state.pdf.numPages))); } catch (e) { fail(e); }
 });
-$("#pdf-analyze").addEventListener("click", () => analyzePdfBlankness().catch(fail));
-$("#pdf-threshold-uncheck").addEventListener("click", async () => {
+$("#pdf-analyze").addEventListener("click", async () => {
   try {
     const threshold = +$("#pdf-blank-threshold").value; if (!Number.isFinite(threshold) || threshold < 0 || threshold > 100) throw new Error("Blank threshold must be between 0 and 100%.");
-    const scores = await analyzePdfBlankness(); scores.forEach((score, i) => setPageKept(i + 1, score < threshold)); status(`Pages at least ${threshold}% blank are unticked · review the page cards`, 100, true);
+    const scores = await analyzePdfBlankness(); scores.forEach((score, i) => setPageKept(i + 1, score < threshold)); updatePdfConfirmation(); const count = scores.filter(score => score >= threshold).length;
+    status(`${count} page${count === 1 ? "" : "s"} at least ${threshold}% blank marked in red · confirm before deletion`, 100, true);
   } catch (e) { fail(e); }
 });
 $("#pdf-auto-blank").addEventListener("click", async () => {
-  try { const scores = await analyzePdfBlankness(), deleted = new Set(scores.map((score, i) => score >= 99.5 ? i + 1 : 0).filter(Boolean)); await downloadPdfWithDeleted(deleted); } catch (e) { fail(e); }
+  try { const scores = await analyzePdfBlankness(); scores.forEach((score, i) => setPageKept(i + 1, score < 99.5)); updatePdfConfirmation(); const count = scores.filter(score => score >= 99.5).length; status(`${count} fully blank page${count === 1 ? "" : "s"} marked in red · confirm before deletion`, 100, true); } catch (e) { fail(e); }
 });
 $("#pdf-delete-unchecked").addEventListener("click", async () => { try { await downloadPdfWithDeleted(uncheckedPdfPages()); } catch (e) { fail(e); } });
 
 // EPUB / MOBI / PDF conversion
-wireDrop($("#book-drop"), $("#book-input"), files => loadBook(files[0]));
+function showBookDetails(book, file) {
+  $("#book-summary").classList.add("show"); $("#book-title").textContent = book.title || file.name;
+  $("#book-meta").textContent = `${book.chapters?.length || book.pageCount || 0} ${book.pageCount ? "pages" : "sections"} · ${book.assets?.length || (book.sourceType === "pdf" ? book.pageCount : 0)} visuals · ${formatBytes(file.size)}${book.author ? ` · ${book.author}` : ""}`;
+  $("#book-type").textContent = book.sourceType.toUpperCase(); $("#book-name").value = book.title || file.name.replace(/\.[^.]+$/, ""); $("#book-author").value = book.author || ""; $("#book-convert").disabled = false;
+}
+function stagePdfForBook(file, pdf, bytes, password) {
+  const book = { sourceType: "pdf", title: file.name.replace(/\.pdf$/i, ""), author: "", pageCount: pdf.numPages, pdf, chapters: [], bytes, password, assets: [] };
+  state.bookFile = file; state.book = book; state.bookPending = null; state.bookPassword = password; $("#book-password-box").classList.remove("show"); $("#book-password").value = ""; showBookDetails(book, file);
+}
 async function loadBook(file, password = "") {
   if (!file || !/\.(epub|mobi|azw3?|azm3|pdf)$/i.test(file.name)) return fail(new Error("Choose a PDF, EPUB, MOBI, AZW, AZW3, or AZM3 file."));
   try {
+    showWorkspaceMode("book");
     status("Opening book locally", 8); state.bookFile = file; const type = file.name.toLowerCase().split(".").pop();
     let book;
     if (type === "epub") book = await parseEpub(file);
     else if (type === "pdf") book = await pdfAsBook(file, false, password);
     else book = await parseMobi(file);
-    state.book = book; state.bookPending = null; state.bookPassword = password; $("#book-password-box").classList.remove("show"); $("#book-password").value = ""; $("#book-drop").style.display = "none"; $("#book-summary").classList.add("show"); $("#book-title").textContent = book.title || file.name; $("#book-meta").textContent = `${book.chapters?.length || book.pageCount || 0} ${book.pageCount ? "pages" : "sections"} · ${book.assets?.length || (book.sourceType === "pdf" ? book.pageCount : 0)} visuals · ${formatBytes(file.size)}${book.author ? ` · ${book.author}` : ""}`; $("#book-type").textContent = book.sourceType.toUpperCase(); $("#book-name").value = book.title || file.name.replace(/\.[^.]+$/, ""); $("#book-author").value = book.author || ""; $("#book-convert").disabled = false; status("Book ready", 100, true);
+    state.book = book; state.bookPending = null; state.bookPassword = password; $("#book-password-box").classList.remove("show"); $("#book-password").value = ""; showBookDetails(book, file); status("Book ready", 100, true);
   } catch (e) {
     if (file.name.toLowerCase().endsWith(".pdf") && isPasswordError(e)) {
       state.book = null; state.bookPending = { file }; state.bookFile = file;
-      $("#book-drop").style.display = "none"; $("#book-summary").classList.add("show"); $("#book-title").textContent = file.name; $("#book-meta").textContent = "Locked PDF · enter its password to continue"; $("#book-type").textContent = "LOCKED";
+      showWorkspaceMode("book"); $("#book-summary").classList.add("show"); $("#book-title").textContent = file.name; $("#book-meta").textContent = "Locked PDF · enter its password to continue"; $("#book-type").textContent = "LOCKED";
       $("#book-password-box").classList.add("show"); $("#book-convert").disabled = true;
       status(password ? "Incorrect password — try again" : "Password required for this PDF", 100, true); setTimeout(() => $("#book-password").focus(), 50); return;
     }
-    state.book = null; fail(new Error(`Could not open this book. ${e.message}`));
+    state.book = null; resetWorkspaceDisplay(); fail(new Error(`Could not open this book. ${e.message}`));
   }
 }
 $("#book-unlock").addEventListener("click", () => { if (state.bookPending) loadBook(state.bookPending.file, $("#book-password").value); });
 $("#book-password").addEventListener("keydown", e => { if (e.key === "Enter") $("#book-unlock").click(); });
 $("#book-reset").addEventListener("click", () => {
+  if ((state.book?.sourceType === "pdf" && state.pdf) || (state.pdfPending && state.bookFile === state.pdfFile)) { $("#pdf-reset").click(); return; }
   state.book?.pdf?.destroy?.();
   state.bookFile = state.book = state.bookPending = null; state.bookPassword = "";
   $("#book-summary").classList.remove("show");
-  $("#book-drop").style.display = "flex";
   $("#book-password-box").classList.remove("show"); $("#book-password").value = "";
   $("#book-convert").disabled = true;
   $("#book-name").value = $("#book-author").value = "";
+  resetWorkspaceDisplay();
 });
 async function zipAssetData(zip, path, assets) {
   const clean = normalizePath(decodeURIComponent(path.split("#")[0])), entry = zip.file(clean); if (!entry) return null;
@@ -581,4 +618,4 @@ function formatBytes(size) { if (size < 1024) return `${size} B`; if (size < 104
 
 window.addEventListener("offline", () => $("#network-proof").textContent = "Connection off · fully operational");
 if (!navigator.onLine) $("#network-proof").textContent = "Connection off · fully operational";
-window.__pageforgeTest = { parseRange, buildMobi, buildAzw3, buildEpub, filterHtml, version: "2.0.0" };
+window.__pageforgeTest = { parseRange, buildMobi, buildAzw3, buildEpub, filterHtml, version: "2.0.1" };
