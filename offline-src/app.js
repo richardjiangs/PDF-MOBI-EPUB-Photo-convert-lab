@@ -5,6 +5,7 @@ import html2canvas from "html2canvas";
 import { initMobiFile, initKf8File } from "@lingo-reader/mobi-parser";
 import { calculateBlankPercentage } from "./blankness.mjs";
 import { calculateFingerprintSimilarity, matchesBlankAndSimilar } from "./similarity.mjs";
+import { buildPdfFromKeptPages } from "./pdf-pages.mjs";
 
 const $ = (s, root = document) => root.querySelector(s);
 const $$ = (s, root = document) => [...root.querySelectorAll(s)];
@@ -328,14 +329,30 @@ function invalidatePdfResult() {
 async function preparePdfWithDeleted(deleted) {
   if (!deleted.size) throw new Error("No pages are marked for deletion. Enter a range or untick one or more page cards.");
   if (deleted.size === state.pdf.numPages) throw new Error("A PDF needs at least one page. Keep one or more pages.");
-  status("Rebuilding PDF without the marked pages", 25); const keep = Array.from({ length: state.pdf.numPages }, (_, i) => i + 1).filter(n => !deleted.has(n)); let bytes, flattened = false;
+  status("Rebuilding PDF without the marked pages", 25); const originalPdf = state.pdf, keep = Array.from({ length: originalPdf.numPages }, (_, i) => i + 1).filter(n => !deleted.has(n)); let bytes, flattened = false;
   try {
     if (state.pdfPassword) throw new Error("Protected document requires flattening");
-    const src = await PDFDocument.load(state.pdfBytes.slice(), { ignoreEncryption: false }), out = await PDFDocument.create(), copied = await out.copyPages(src, keep.map(n => n - 1)); copied.forEach(p => out.addPage(p)); bytes = await out.save({ useObjectStreams: true });
-  } catch { bytes = await flattenPdfPages(state.pdf, keep); flattened = true; }
-  const stem = safeName(state.pdfFile.name.replace(/\.pdf$/i, "")); state.pdfResult = { bytes, keep, deleted: new Set(deleted), flattened, stem };
-  $("#pdf-result-name").value = `${stem}-cleaned`; $("#pdf-result-summary").textContent = `${keep.length} page${keep.length === 1 ? "" : "s"} kept · ${deleted.size} removed${flattened ? " · protected PDF flattened" : ""}`;
-  $("#pdf-result-box").classList.add("show"); $("#pdf-result-download").disabled = false; status(`Cleaned result prepared · choose its format below`, 100, true);
+    bytes = await buildPdfFromKeptPages(state.pdfBytes, keep);
+  } catch { bytes = await flattenPdfPages(originalPdf, keep); flattened = true; }
+
+  const cleanedBytes = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  const stem = safeName(state.pdfFile.name.replace(/\.pdf$/i, "").replace(/(?:-cleaned)+$/i, ""));
+  const cleanedName = `${stem}-cleaned`;
+  const cleanedPdf = await pdfjsLib.getDocument({ data: cleanedBytes.slice() }).promise;
+  const cleanedFile = new File([cleanedBytes], `${cleanedName}.pdf`, { type: "application/pdf", lastModified: Date.now() });
+
+  state.pdfFile = cleanedFile; state.pdfBytes = cleanedBytes; state.pdf = cleanedPdf; state.pdfPending = null; state.pdfPassword = "";
+  state.pdfBlankness.clear(); state.pdfFingerprints.clear(); state.pdfReferencePage = null;
+  state.pdfResult = { bytes: cleanedBytes, keep, deleted: new Set(deleted), flattened, stem };
+  $("#pdf-reference-status").textContent = "Click a page preview to make it the blue reference."; $("#pdf-find-similar").disabled = true;
+  $("#pdf-delete-range").value = ""; $("#pdf-direct-name").value = cleanedName;
+  $("#pdf-count").textContent = `${cleanedPdf.numPages} pages · ${formatBytes(cleanedFile.size)}`;
+  renderPdfPlaceholders(); updatePdfConfirmation(); stagePdfForBook(cleanedFile, cleanedPdf, cleanedBytes, "");
+  await originalPdf.destroy?.();
+
+  $("#pdf-result-name").value = cleanedName; $("#pdf-result-summary").textContent = `${cleanedPdf.numPages} page${cleanedPdf.numPages === 1 ? "" : "s"} remain · ${deleted.size} removed${flattened ? " · protected PDF flattened" : ""}`;
+  $("#pdf-result-box").classList.add("show"); $("#pdf-result-download").disabled = false;
+  status(`${deleted.size} marked page${deleted.size === 1 ? "" : "s"} removed from the workspace · choose a download format`, 100, true);
 }
 $("#pdf-delete").addEventListener("click", async () => {
   try {
@@ -711,4 +728,4 @@ function formatBytes(size) { if (size < 1024) return `${size} B`; if (size < 104
 
 window.addEventListener("offline", () => $("#network-proof").textContent = "Connection off · fully operational");
 if (!navigator.onLine) $("#network-proof").textContent = "Connection off · fully operational";
-window.__pageforgeTest = { parseRange, buildMobi, buildAzw3, buildEpub, filterHtml, version: "2.2.0" };
+window.__pageforgeTest = { parseRange, buildMobi, buildAzw3, buildEpub, filterHtml, version: "2.2.1" };

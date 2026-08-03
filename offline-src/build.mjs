@@ -35,6 +35,7 @@ await writeFile(resolve(root, "outputs/PageForge-Local 2.0.html"), standaloneHtm
 await writeFile(resolve(root, "outputs/PageForge-Local 2.0.1.html"), standaloneHtml);
 await writeFile(resolve(root, "outputs/PageForge-Local 2.1.html"), standaloneHtml);
 await writeFile(resolve(root, "outputs/PageForge-Local 2.2.html"), standaloneHtml);
+await writeFile(resolve(root, "outputs/PageForge-Local 2.2.1.html"), standaloneHtml);
 await writeFile(resolve(root, "public/PageForge.html"), standaloneHtml);
 await writeFile(resolve(root, "index.html"), websiteHtml);
 await writeFile(resolve(root, "public/index.html"), websiteHtml);
@@ -43,6 +44,7 @@ await writeFile(resolve(root, "docs/index.html"), websiteHtml);
 await writeFile(resolve(root, "docs/PageForge.html"), standaloneHtml);
 await writeFile(resolve(root, "docs/.nojekyll"), "");
 await copyFile(resolve(root, "public/og.png"), resolve(root, "docs/og.png"));
+await copyFile(resolve(root, "public/og-2.2.1.png"), resolve(root, "docs/og-2.2.1.png"));
 await copyFile(resolve(root, "public/favicon.png"), resolve(root, "docs/favicon.png"));
 await writeFile(resolve(root, "work/pageforge.bundle.js"), bundle);
-console.log(`Built PageForge-Local 2.2.html (${(standaloneHtml.length / 1048576).toFixed(2)} MB), website, and GitHub Pages edition`);
+console.log(`Built PageForge-Local 2.2.1.html (${(standaloneHtml.length / 1048576).toFixed(2)} MB), website, and GitHub Pages edition`);

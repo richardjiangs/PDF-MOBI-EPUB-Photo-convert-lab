@@ -3,6 +3,8 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { calculateBlankPercentage } from "../offline-src/blankness.mjs";
 import { calculateFingerprintSimilarity, matchesBlankAndSimilar } from "../offline-src/similarity.mjs";
+import { buildPdfFromKeptPages } from "../offline-src/pdf-pages.mjs";
+import { PDFDocument } from "pdf-lib";
 
 test("blank-page analysis returns exact percentages for threshold marking", () => {
   const pixels = new Uint8ClampedArray(10 * 4);
@@ -27,6 +29,18 @@ test("page fingerprint similarity distinguishes matching and different pages", (
   assert.equal(calculateFingerprintSimilarity(white, new Uint8Array(4)), 0);
 });
 
+test("confirmed PDF deletion creates a PDF containing only kept pages", async () => {
+  const source = await PDFDocument.create();
+  source.addPage([100, 200]); source.addPage([200, 300]); source.addPage([300, 400]);
+  const output = await buildPdfFromKeptPages(await source.save(), [1, 3]);
+  const cleaned = await PDFDocument.load(output);
+  assert.equal(cleaned.getPageCount(), 2);
+  assert.deepEqual(cleaned.getPages().map(page => page.getSize()), [
+    { width: 100, height: 200 },
+    { width: 300, height: 400 },
+  ]);
+});
+
 async function render() {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
   workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
@@ -43,7 +57,7 @@ test("server-renders the PageForge preview wrapper", async () => {
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
   const html = await response.text();
-  assert.match(html, /<title>PageForge Local 2\.2<\/title>/i);
+  assert.match(html, /<title>PageForge Local 2\.2\.1<\/title>/i);
   assert.match(html, /<iframe[^>]+src="\/PageForge-Website\.html"/i);
   assert.match(html, /PageForge Local preview/i);
 });
@@ -51,7 +65,7 @@ test("server-renders the PageForge preview wrapper", async () => {
 test("ships separate standalone and website editions", async () => {
   const [output, versionedOutput, served, website, publicWebsite, hostedWebsite, githubPages, source, template] = await Promise.all([
     readFile(new URL("../outputs/PageForge.html", import.meta.url), "utf8"),
-    readFile(new URL("../outputs/PageForge-Local%202.2.html", import.meta.url), "utf8"),
+    readFile(new URL("../outputs/PageForge-Local%202.2.1.html", import.meta.url), "utf8"),
     readFile(new URL("../public/PageForge.html", import.meta.url), "utf8"),
     readFile(new URL("../index.html", import.meta.url), "utf8"),
     readFile(new URL("../public/index.html", import.meta.url), "utf8"),
@@ -66,7 +80,7 @@ test("ships separate standalone and website editions", async () => {
   assert.equal(hostedWebsite, website);
   assert.equal(githubPages, website);
   assert.match(output, /PAGEFORGE LOCAL/);
-  assert.match(output, /PAGEFORGE LOCAL 2\.2/);
+  assert.match(output, /PAGEFORGE LOCAL 2\.2\.1/);
   assert.match(output, /id="unified-input"[^>]+multiple/i);
   assert.match(output, /Drop photos, a PDF, or an ebook here/i);
   assert.doesNotMatch(output, /id="(?:photo|pdf|book)-drop"/i);
@@ -104,6 +118,8 @@ test("ships separate standalone and website editions", async () => {
   assert.match(source, /async function analyzePdfBlankness/);
   assert.match(source, /calculateFingerprintSimilarity/);
   assert.match(source, /async function preparePdfWithDeleted/);
+  assert.match(source, /state\.pdf = cleanedPdf/);
+  assert.match(source, /renderPdfPlaceholders\(\); updatePdfConfirmation\(\); stagePdfForBook/);
   assert.match(source, /async function markPdfBlankCandidates/);
   assert.match(source, /"combined"/);
   assert.match(source, /"range"/);
