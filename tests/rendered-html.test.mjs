@@ -4,6 +4,7 @@ import test from "node:test";
 import { calculateBlankPercentage } from "../offline-src/blankness.mjs";
 import { calculateFingerprintSimilarity, matchesBlankAndSimilar } from "../offline-src/similarity.mjs";
 import { buildPdfFromKeptPages } from "../offline-src/pdf-pages.mjs";
+import { chapterNavigationLabel, createPdfBookChapter, wrapKf8Chapter, wrapMobiChapter } from "../offline-src/book-content.mjs";
 import { PDFDocument } from "pdf-lib";
 
 test("blank-page analysis returns exact percentages for threshold marking", () => {
@@ -41,6 +42,30 @@ test("confirmed PDF deletion creates a PDF containing only kept pages", async ()
   ]);
 });
 
+test("PDF book conversion never duplicates extracted text and a page image", () => {
+  const text = createPdfBookChapter({ pageNo: 1, lines: ["SOURCE TEXT ALPHA"], hasVisualArt: false });
+  assert.equal(text.kind, "reflow-text");
+  assert.match(text.html, /SOURCE TEXT ALPHA/);
+  assert.doesNotMatch(text.html, /<img\b|Page 1/i);
+
+  const image = createPdfBookChapter({ pageNo: 2, lines: ["TEXT INSIDE A VISUAL PAGE"], hasVisualArt: true, imageData: "data:image/jpeg;base64,AAAA" });
+  assert.equal(image.kind, "page-image");
+  assert.match(image.html, /<img\b/);
+  assert.doesNotMatch(image.html, /TEXT INSIDE A VISUAL PAGE|<h[1-6]\b/i);
+  assert.equal(chapterNavigationLabel(image, 1), "Page 2");
+
+  assert.equal(createPdfBookChapter({ pageNo: 3, lines: [], hasVisualArt: false }), null);
+});
+
+test("ebook writers do not inject visible page or section headings", () => {
+  const body = '<img alt="Artwork" src="data:image/png;base64,AAAA">';
+  assert.equal(wrapMobiChapter(body), body);
+  assert.equal(wrapKf8Chapter(body), `<section>${body}</section>`);
+  assert.doesNotMatch(wrapMobiChapter(body), /<h[1-6]\b|Page \d+|Section \d+/i);
+  assert.doesNotMatch(wrapKf8Chapter(body), /<h[1-6]\b|Page \d+|Section \d+/i);
+  assert.equal(chapterNavigationLabel({ title: "Original Chapter", navLabel: "Section 9" }, 8), "Original Chapter");
+});
+
 async function render() {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
   workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
@@ -57,7 +82,7 @@ test("server-renders the PageForge preview wrapper", async () => {
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
   const html = await response.text();
-  assert.match(html, /<title>PageForge Local 2\.2\.1<\/title>/i);
+  assert.match(html, /<title>PageForge Local 3\.0<\/title>/i);
   assert.match(html, /<iframe[^>]+src="\/PageForge-Website\.html"/i);
   assert.match(html, /PageForge Local preview/i);
 });
@@ -65,7 +90,7 @@ test("server-renders the PageForge preview wrapper", async () => {
 test("ships separate standalone and website editions", async () => {
   const [output, versionedOutput, served, website, publicWebsite, hostedWebsite, githubPages, source, template] = await Promise.all([
     readFile(new URL("../outputs/PageForge.html", import.meta.url), "utf8"),
-    readFile(new URL("../outputs/PageForge-Local%202.2.1.html", import.meta.url), "utf8"),
+    readFile(new URL("../outputs/PageForge-Local%203.0.html", import.meta.url), "utf8"),
     readFile(new URL("../public/PageForge.html", import.meta.url), "utf8"),
     readFile(new URL("../index.html", import.meta.url), "utf8"),
     readFile(new URL("../public/index.html", import.meta.url), "utf8"),
@@ -80,7 +105,7 @@ test("ships separate standalone and website editions", async () => {
   assert.equal(hostedWebsite, website);
   assert.equal(githubPages, website);
   assert.match(output, /PAGEFORGE LOCAL/);
-  assert.match(output, /PAGEFORGE LOCAL 2\.2\.1/);
+  assert.match(output, /PAGEFORGE LOCAL 3\.0/);
   assert.match(output, /id="unified-input"[^>]+multiple/i);
   assert.match(output, /Drop photos, a PDF, or an ebook here/i);
   assert.doesNotMatch(output, /id="(?:photo|pdf|book)-drop"/i);
@@ -127,6 +152,11 @@ test("ships separate standalone and website editions", async () => {
   assert.doesNotMatch(source, /pdf-jump-convert/);
   assert.match(source, /function handleUnifiedFiles/);
   assert.match(source, /data-page-render/);
+  assert.match(source, /createPdfBookChapter/);
+  assert.match(source, /wrapMobiChapter/);
+  assert.match(source, /wrapKf8Chapter/);
+  assert.doesNotMatch(source, /sections\.push\(`<h2>/);
+  assert.doesNotMatch(source, /sections\.push\(`<section><h2>/);
   assert.match(source, /initKf8File/);
   const controlIds = [...source.matchAll(/\$\("#([A-Za-z0-9_-]+)"/g)].map(match => match[1]);
   assert.deepEqual([...new Set(controlIds)].filter(id => !new RegExp(`id=["']${id}["']`).test(template)), []);

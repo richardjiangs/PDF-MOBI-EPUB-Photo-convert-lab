@@ -6,6 +6,7 @@ import { initMobiFile, initKf8File } from "@lingo-reader/mobi-parser";
 import { calculateBlankPercentage } from "./blankness.mjs";
 import { calculateFingerprintSimilarity, matchesBlankAndSimilar } from "./similarity.mjs";
 import { buildPdfFromKeptPages } from "./pdf-pages.mjs";
+import { chapterNavigationLabel, cleanChapterTitle, createPdfBookChapter, wrapKf8Chapter, wrapMobiChapter } from "./book-content.mjs";
 
 const $ = (s, root = document) => root.querySelector(s);
 const $$ = (s, root = document) => [...root.querySelectorAll(s)];
@@ -408,7 +409,8 @@ function configureBookMode(sourceType) {
 function showBookDetails(book, file) {
   configureBookMode(book.sourceType);
   $("#book-summary").classList.add("show"); $("#book-title").textContent = book.title || file.name;
-  $("#book-meta").textContent = `${book.chapters?.length || book.pageCount || 0} ${book.pageCount ? "pages" : "sections"} · ${book.assets?.length || (book.sourceType === "pdf" ? book.pageCount : 0)} visuals · ${formatBytes(file.size)}${book.author ? ` · ${book.author}` : ""}`;
+  const visualLabel = book.sourceType === "pdf" && !book.chapters.length ? "visuals detected during conversion" : `${book.assets?.length || 0} visuals`;
+  $("#book-meta").textContent = `${book.chapters?.length || book.pageCount || 0} ${book.pageCount ? "pages" : "sections"} · ${visualLabel} · ${formatBytes(file.size)}${book.author ? ` · ${book.author}` : ""}`;
   $("#book-type").textContent = book.sourceType.toUpperCase(); $("#book-name").value = book.title || file.name.replace(/\.[^.]+$/, ""); $("#book-author").value = book.author || ""; $("#book-convert").disabled = false;
 }
 function stagePdfForBook(file, pdf, bytes, password) {
@@ -491,8 +493,18 @@ async function parseEpub(file) {
   const zip = await JSZip.loadAsync(file), container = await zip.file("META-INF/container.xml")?.async("text"); if (!container) throw new Error("EPUB container.xml is missing.");
   const cdoc = new DOMParser().parseFromString(container, "application/xml"), opfPath = cdoc.querySelector("rootfile")?.getAttribute("full-path"); if (!opfPath) throw new Error("EPUB package path is missing.");
   const opfText = await zip.file(opfPath)?.async("text"), opf = new DOMParser().parseFromString(opfText, "application/xml"), base = dirname(opfPath), manifest = new Map($$("manifest item", opf).map(x => [x.getAttribute("id"), { id: x.getAttribute("id"), href: normalizePath(base + x.getAttribute("href")), type: x.getAttribute("media-type") || "", properties: x.getAttribute("properties") || "" }]));
-  const title = opf.querySelector("metadata title, metadata dc\\:title")?.textContent?.trim() || file.name.replace(/\.epub$/i, ""), author = opf.querySelector("metadata creator, metadata dc\\:creator")?.textContent?.trim() || "", chapters = [], assets = new Set(), refs = $$("spine itemref", opf);
-  for (let i = 0; i < refs.length; i++) { status(`Reading EPUB section ${i + 1} of ${refs.length}`, 10 + (i / Math.max(1, refs.length)) * 75); const item = manifest.get(refs[i].getAttribute("idref")); if (!item) continue; const chapter = await zip.file(item.href)?.async("text"); if (!chapter) continue; chapters.push({ title: `Section ${i + 1}`, html: await inlineEpubChapter(chapter, item.href, zip, assets) }); await tick(); }
+  const title = opf.querySelector("metadata title, metadata dc\\:title")?.textContent?.trim() || file.name.replace(/\.epub$/i, ""), author = opf.querySelector("metadata creator, metadata dc\\:creator")?.textContent?.trim() || "", chapters = [], assets = new Set(), refs = $$("spine itemref", opf), tocTitles = new Map();
+  const navItem = [...manifest.values()].find(item => item.properties.split(/\s+/).includes("nav"));
+  if (navItem) {
+    const navMarkup = await zip.file(navItem.href)?.async("text");
+    if (navMarkup) { const navDoc = new DOMParser().parseFromString(navMarkup, "text/html"); for (const link of $$("nav a[href]", navDoc)) { const href = normalizePath(dirname(navItem.href) + link.getAttribute("href").split("#")[0]), label = cleanChapterTitle(link.textContent); if (href && label && !tocTitles.has(href)) tocTitles.set(href, label); } }
+  }
+  const ncxId = opf.querySelector("spine")?.getAttribute("toc"), ncxItem = ncxId ? manifest.get(ncxId) : [...manifest.values()].find(item => item.type === "application/x-dtbncx+xml");
+  if (ncxItem) {
+    const ncxMarkup = await zip.file(ncxItem.href)?.async("text");
+    if (ncxMarkup) { const ncxDoc = new DOMParser().parseFromString(ncxMarkup, "application/xml"); for (const point of $$("navPoint", ncxDoc)) { const raw = point.querySelector("content")?.getAttribute("src"), label = cleanChapterTitle(point.querySelector("navLabel text")?.textContent); const href = raw && normalizePath(dirname(ncxItem.href) + raw.split("#")[0]); if (href && label && !tocTitles.has(href)) tocTitles.set(href, label); } }
+  }
+  for (let i = 0; i < refs.length; i++) { status(`Reading EPUB section ${i + 1} of ${refs.length}`, 10 + (i / Math.max(1, refs.length)) * 75); const item = manifest.get(refs[i].getAttribute("idref")); if (!item) continue; const chapter = await zip.file(item.href)?.async("text"); if (!chapter) continue; const chapterDoc = new DOMParser().parseFromString(chapter, "text/html"), chapterTitle = tocTitles.get(item.href) || cleanChapterTitle(chapterDoc.querySelector("title")?.textContent); chapters.push({ title: chapterTitle, navLabel: chapterTitle || `Section ${i + 1}`, html: await inlineEpubChapter(chapter, item.href, zip, assets) }); await tick(); }
   // Inventory every packaged image, including unreferenced plates and covers outside the spine.
   for (const item of manifest.values()) if (item.type.startsWith("image/") || mimeFromPath(item.href).startsWith("image/")) await zipAssetData(zip, item.href, assets);
   const coverId = opf.querySelector('meta[name="cover"]')?.getAttribute("content"), guideHref = opf.querySelector('guide reference[type~="cover"]')?.getAttribute("href"), cover = [...manifest.values()].find(x => x.properties.split(/\s+/).includes("cover-image")) || manifest.get(coverId) || [...manifest.values()].find(x => /cover/i.test(x.id || "") && x.type.startsWith("image/"));
@@ -504,8 +516,8 @@ async function parseEpub(file) {
 async function parseMobi(file) {
   let mobi; const sourceExt = file.name.toLowerCase().split(".").pop(), preferKf8 = sourceExt === "azw3" || sourceExt === "azm3";
   try { mobi = preferKf8 ? await initKf8File(file) : await initMobiFile(file); } catch { mobi = preferKf8 ? await initMobiFile(file) : await initKf8File(file); }
-  const meta = mobi.getMetadata(), spine = mobi.getSpine(), chapters = [], assets = new Set();
-  for (let i = 0; i < spine.length; i++) { status(`Reading MOBI section ${i + 1} of ${spine.length}`, 10 + (i / Math.max(1, spine.length)) * 75); const loaded = mobi.loadChapter(spine[i].id); if (!loaded) continue; let html = loaded.html; for (const css of loaded.css || []) { try { html = `<style>${await (await realFetch(css.href)).text()}</style>` + html; } catch {} } html = await inlineBlobImages(html, assets); chapters.push({ title: `Section ${i + 1}`, html }); await tick(); }
+  const meta = mobi.getMetadata(), spine = mobi.getSpine(), chapters = [], assets = new Set(), tocTitles = new Map(), visitToc = items => { for (const item of items || []) { const resolved = mobi.resolveHref?.(item.href), label = cleanChapterTitle(item.label); if (resolved?.id != null && label && !tocTitles.has(String(resolved.id))) tocTitles.set(String(resolved.id), label); visitToc(item.children); } }; visitToc(mobi.getToc?.());
+  for (let i = 0; i < spine.length; i++) { status(`Reading MOBI section ${i + 1} of ${spine.length}`, 10 + (i / Math.max(1, spine.length)) * 75); const loaded = mobi.loadChapter(spine[i].id); if (!loaded) continue; let html = loaded.html; for (const css of loaded.css || []) { try { html = `<style>${await (await realFetch(css.href)).text()}</style>` + html; } catch {} } html = await inlineBlobImages(html, assets); const chapterTitle = tocTitles.get(String(spine[i].id)) || ""; chapters.push({ title: chapterTitle, navLabel: chapterTitle || `Section ${i + 1}`, html }); await tick(); }
   const cover = mobi.getCoverImage?.(); if (cover) { try { const data = await blobToDataURL(await (await realFetch(cover)).blob()); assets.add(data); if (!chapters.some(ch => ch.html.includes(data))) chapters.unshift({ title: "Cover", html: `<img alt="Cover" src="${data}">` }); } catch {} }
   mobi.destroy(); if (!chapters.length) throw new Error("No readable MOBI/KF8 sections were found."); return { sourceType: sourceExt === "azm3" ? "azm3" : preferKf8 ? "azw3" : "mobi", title: meta.title || file.name.replace(/\.[^.]+$/, ""), author: (meta.author || []).join(", "), chapters, assets: [...assets] };
 }
@@ -528,9 +540,9 @@ async function pdfAsBook(file, renderPages = true, password = "", existingBytes 
     const page = await pdf.getPage(i), content = await page.getTextContent(), operators = await page.getOperatorList(), lines = []; let line = [];
     for (const item of content.items || []) { const value = String(item.str || "").trim(); if (value) line.push(value); if (item.hasEOL && line.length) { lines.push(line.join(" ")); line = []; } }
     if (line.length) lines.push(line.join(" "));
-    const imageOps = new Set([pdfjsLib.OPS.paintImageXObject, pdfjsLib.OPS.paintJpegXObject, pdfjsLib.OPS.paintInlineImageXObject, pdfjsLib.OPS.paintImageMaskXObject].filter(Number.isFinite)), hasRasterArt = operators.fnArray.some(op => imageOps.has(op)), pageKind = hasRasterArt ? "content" : lines.length ? "text-only" : "blank"; page.cleanup();
-    const blob = await renderPdfPage(pdf, i, 1.45, "jpeg", .88), data = await blobToDataURL(blob), textHtml = lines.length ? `<div class="pdf-page-text">${lines.map(value => `<p>${escapeHtml(value)}</p>`).join("")}</div>` : "";
-    if (hasRasterArt) book.assets.push(data); book.chapters.push({ title: `Page ${i}`, html: `${textHtml}<div class="pdf-page-art" style="text-align:center"><img data-page-render="${pageKind}" alt="Rendered PDF page ${i}" src="${data}"></div>` }); await tick();
+    const visualOps = new Set([pdfjsLib.OPS.stroke, pdfjsLib.OPS.closeStroke, pdfjsLib.OPS.fill, pdfjsLib.OPS.eoFill, pdfjsLib.OPS.fillStroke, pdfjsLib.OPS.eoFillStroke, pdfjsLib.OPS.closeFillStroke, pdfjsLib.OPS.closeEOFillStroke, pdfjsLib.OPS.shadingFill, pdfjsLib.OPS.paintXObject, pdfjsLib.OPS.paintFormXObjectBegin, pdfjsLib.OPS.paintImageMaskXObject, pdfjsLib.OPS.paintImageMaskXObjectGroup, pdfjsLib.OPS.paintImageXObject, pdfjsLib.OPS.paintInlineImageXObject, pdfjsLib.OPS.paintInlineImageXObjectGroup, pdfjsLib.OPS.paintImageXObjectRepeat, pdfjsLib.OPS.paintImageMaskXObjectRepeat, pdfjsLib.OPS.paintSolidColorImageMask, pdfjsLib.OPS.rawFillPath].filter(Number.isFinite)), hasVisualArt = operators.fnArray.some(op => visualOps.has(op)); page.cleanup();
+    const data = hasVisualArt ? await blobToDataURL(await renderPdfPage(pdf, i, 1.45, "jpeg", .9)) : "", chapter = createPdfBookChapter({ pageNo: i, lines, hasVisualArt, imageData: data });
+    if (chapter) { book.assets.push(...chapter.assets); book.chapters.push(chapter); } await tick();
   }
   return book;
 }
@@ -607,7 +619,7 @@ $("#pdf-direct-download").addEventListener("click", async () => {
     if (!state.pdf) throw new Error("Choose a PDF first."); const output = $("#pdf-direct-format").value, title = safeName($("#pdf-direct-name").value, state.pdfFile.name.replace(/\.pdf$/i, ""));
     if (output === "pdf") downloadBlob(bytesToBlob(state.pdfBytes, "application/pdf"), `${title}.pdf`);
     else if (["jpeg", "png", "webp"].includes(output)) { const scale = +$("#pdf-direct-photo-quality").value, compression = scale <= 1 ? .8 : scale <= 1.5 ? .88 : scale <= 2 ? .93 : .97; await downloadPdfPhotos(state.pdf, title, output, scale, compression, true); }
-    else { generatedBook = await pdfAsBook(state.pdfFile, true, state.pdfPassword, state.pdfBytes); generatedBook.title = title; await downloadBookArtifact(generatedBook, output, title); }
+    else { generatedBook = await pdfAsBook(state.pdfFile, true, state.pdfPassword, state.pdfBytes); if (!generatedBook.chapters.length) throw new Error("No visible text or artwork remains to convert."); generatedBook.title = title; await downloadBookArtifact(generatedBook, output, title); }
     status(`${output.toUpperCase()} downloaded`, 100, true);
   } catch (e) { if (e?.name === "AbortError") status("Save canceled", 100, true); else fail(e); } finally { generatedBook?.pdf?.destroy?.(); }
 });
@@ -626,26 +638,25 @@ $("#pdf-result-download").addEventListener("click", async () => {
       cleanPdf = await pdfjsLib.getDocument({ data: result.bytes.slice() }).promise;
       await downloadPdfPhotos(cleanPdf, title, output, scale, compression);
     } else {
-      const file = new File([result.bytes], `${title}.pdf`, { type: "application/pdf" }); generatedBook = await pdfAsBook(file, true, "", result.bytes); generatedBook.title = title; await downloadBookArtifact(generatedBook, output, title);
+      const file = new File([result.bytes], `${title}.pdf`, { type: "application/pdf" }); generatedBook = await pdfAsBook(file, true, "", result.bytes); if (!generatedBook.chapters.length) throw new Error("No visible text or artwork remains to convert."); generatedBook.title = title; await downloadBookArtifact(generatedBook, output, title);
     }
     status(`${output.toUpperCase()} export downloaded`, 100, true);
   } catch (e) { fail(e); } finally { cleanPdf?.destroy?.(); generatedBook?.pdf?.destroy?.(); }
 });
 
 async function waitForImages(root) { await Promise.all($$("img", root).map(img => img.complete ? img.decode?.().catch(() => {}) : new Promise(resolve => { img.onload = img.onerror = resolve; }))); }
-async function makePrintPages(chapter, index) {
+async function makePrintPages(chapter) {
   const host = $("#render-host"), doc = new DOMParser().parseFromString(chapter.html, "text/html"), styles = $$("style", doc).map(x => x.cloneNode(true)); $$('script,iframe,object,embed', doc).forEach(x => x.remove());
   const sourceNodes = [...doc.body.childNodes].filter(n => n.nodeType !== 3 || n.textContent.trim()); const pages = [];
   const newPage = () => { const p = document.createElement("div"); p.className = "print-page"; styles.forEach(s => p.append(s.cloneNode(true))); host.append(p); pages.push(p); return p; };
   let page = newPage(), contentCount = 0;
-  if (index === 0 && chapter.title) { const h = document.createElement("h1"); h.textContent = chapter.title; page.append(h); contentCount++; }
   for (const original of sourceNodes) { const node = original.cloneNode(true); page.append(node); contentCount++; await waitForImages(node.nodeType === 1 ? node : page); if (page.scrollHeight > page.clientHeight && contentCount > 1) { node.remove(); page = newPage(); page.append(node); contentCount = 1; await waitForImages(page); } }
   return pages;
 }
 async function bookToPdf(book) {
   const pdf = await PDFDocument.create(); const total = book.chapters.length;
   for (let i = 0; i < total; i++) {
-    status(`Typesetting section ${i + 1} of ${total}`, (i / total) * 88); const pages = await makePrintPages(book.chapters[i], i); await tick();
+    status(`Typesetting section ${i + 1} of ${total}`, (i / total) * 88); const pages = await makePrintPages(book.chapters[i]); await tick();
     for (const element of pages) { const canvas = await html2canvas(element, { backgroundColor: "#ffffff", scale: 1.35, logging: false, useCORS: false, imageTimeout: 0 }); const jpg = dataUrlToBytes(canvas.toDataURL("image/jpeg", .9)).bytes; const image = await pdf.embedJpg(jpg); const page = pdf.addPage([595.28, 841.89]); page.drawImage(image, { x: 0, y: 0, width: 595.28, height: 841.89 }); element.remove(); }
   }
   if (!pdf.getPageCount()) pdf.addPage([595.28, 841.89]); status("Finalizing PDF", 94); return bytesToBlob(await pdf.save({ useObjectStreams: true }), "application/pdf");
@@ -657,7 +668,7 @@ async function buildEpub(book) {
   for (let i = 0; i < book.chapters.length; i++) {
     const doc = new DOMParser().parseFromString(book.chapters[i].html, "text/html");
     for (const img of $$("img[src^='data:']", doc)) { const { bytes, mime } = dataUrlToBytes(img.getAttribute("src")); const ext = extFromMime(mime); const name = `image-${++imageNo}.${ext}`; zip.file(`OEBPS/images/${name}`, bytes); img.setAttribute("src", `../images/${name}`); imageItems.push(`<item id="img${imageNo}" href="images/${name}" media-type="${mime}"/>`); }
-    $$('script,iframe,object,embed', doc).forEach(x => x.remove()); const id = `ch${i + 1}`, name = `chapter-${i + 1}.xhtml`; zip.file(`OEBPS/text/${name}`, xhtmlDocument(book.chapters[i].title || `Section ${i + 1}`, doc.body.innerHTML)); chapterItems.push(`<item id="${id}" href="text/${name}" media-type="application/xhtml+xml"/>`); navLinks.push(`<li><a href="text/${name}">${escapeHtml(book.chapters[i].title || `Section ${i + 1}`)}</a></li>`); status(`Packaging section ${i + 1} of ${book.chapters.length}`, 20 + (i / book.chapters.length) * 60); await tick();
+    $$('script,iframe,object,embed', doc).forEach(x => x.remove()); const id = `ch${i + 1}`, name = `chapter-${i + 1}.xhtml`, label = chapterNavigationLabel(book.chapters[i], i); zip.file(`OEBPS/text/${name}`, xhtmlDocument(label, doc.body.innerHTML)); chapterItems.push(`<item id="${id}" href="text/${name}" media-type="application/xhtml+xml"/>`); navLinks.push(`<li><a href="text/${name}">${escapeHtml(label)}</a></li>`); status(`Packaging section ${i + 1} of ${book.chapters.length}`, 20 + (i / book.chapters.length) * 60); await tick();
   }
   const uid = `urn:uuid:${crypto.randomUUID()}`; zip.file("OEBPS/nav.xhtml", xhtmlDocument("Contents", `<nav epub:type="toc" xmlns:epub="http://www.idpf.org/2007/ops"><h1>Contents</h1><ol>${navLinks.join("")}</ol></nav>`));
   zip.file("OEBPS/content.opf", `<?xml version="1.0" encoding="UTF-8"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="uid">${uid}</dc:identifier><dc:title>${escapeHtml(book.title)}</dc:title><dc:creator>${escapeHtml(book.author || "")}</dc:creator><dc:language>en</dc:language><meta property="dcterms:modified">${new Date().toISOString().replace(/\.\d{3}Z$/, "Z")}</meta></metadata><manifest><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>${chapterItems.join("")}${imageItems.join("")}</manifest><spine>${book.chapters.map((_, i) => `<itemref idref="ch${i + 1}"/>`).join("")}</spine></package>`);
@@ -677,7 +688,7 @@ function buildMobi(book) {
   for (const chapter of book.chapters) {
     const doc = new DOMParser().parseFromString(chapter.html, "text/html");
     for (const img of $$("img[src^='data:']", doc)) { const { bytes } = dataUrlToBytes(img.getAttribute("src")); images.push(bytes); img.removeAttribute("src"); img.setAttribute("recindex", String(++imageNo)); }
-    $$('style,script,iframe,object,embed,svg', doc).forEach(x => x.remove()); sections.push(`<h2>${escapeHtml(chapter.title || "")}</h2>${doc.body.innerHTML}`);
+    $$('style,script,iframe,object,embed,svg', doc).forEach(x => x.remove()); sections.push(wrapMobiChapter(doc.body.innerHTML));
   }
   const html = `<html><head><title>${escapeHtml(book.title)}</title></head><body>${sections.join("<mbp:pagebreak/>")}</body></html>`, text = enc.encode(html), chunks = []; for (let at = 0; at < text.length; at += 4096) chunks.push(text.slice(at, at + 4096)); if (!chunks.length) chunks.push(new Uint8Array());
   const exth = makeExth(book), titleBytes = enc.encode(book.title || "PageForge book"), record0 = new Uint8Array(248 + exth.length + titleBytes.length), rv = new DataView(record0.buffer), resourceStart = 1 + chunks.length;
@@ -715,7 +726,7 @@ function buildAzw3(book) {
   for (const chapter of book.chapters) {
     const doc = new DOMParser().parseFromString(chapter.html, "text/html");
     for (const img of $$("img[src^='data:']", doc)) { const { bytes, mime } = dataUrlToBytes(img.getAttribute("src")); images.push(bytes); const id = (++imageNo).toString(36).toUpperCase().padStart(4, "0"); img.setAttribute("src", `kindle:embed:${id}?mime=${mime}`); }
-    $$('style,script,iframe,object,embed,svg', doc).forEach(x => x.remove()); sections.push(`<section><h2>${escapeHtml(chapter.title || "")}</h2>${doc.body.innerHTML}</section>`);
+    $$('style,script,iframe,object,embed,svg', doc).forEach(x => x.remove()); sections.push(wrapKf8Chapter(doc.body.innerHTML));
   }
   const html = `<html xmlns="http://www.w3.org/1999/xhtml"><head><meta charset="utf-8"/><title>${escapeHtml(book.title)}</title></head><body>${sections.join("")}</body></html>`, text = enc.encode(html), chunks = []; for (let at = 0; at < text.length; at += 4096) chunks.push(text.slice(at, at + 4096)); if (!chunks.length) chunks.push(new Uint8Array());
   const fdstIndex = 1 + chunks.length, skelIndex = fdstIndex + 1, fragIndex = skelIndex + 2, resourceStart = fragIndex + 1;
@@ -728,4 +739,4 @@ function formatBytes(size) { if (size < 1024) return `${size} B`; if (size < 104
 
 window.addEventListener("offline", () => $("#network-proof").textContent = "Connection off · fully operational");
 if (!navigator.onLine) $("#network-proof").textContent = "Connection off · fully operational";
-window.__pageforgeTest = { parseRange, buildMobi, buildAzw3, buildEpub, filterHtml, version: "2.2.1" };
+window.__pageforgeTest = { parseRange, buildMobi, buildAzw3, buildEpub, filterHtml, version: "3.0" };

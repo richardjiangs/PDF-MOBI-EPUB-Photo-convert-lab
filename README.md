@@ -1,4 +1,4 @@
-# PageForge Local 2.2.1
+# PageForge Local 3.0
 
 PageForge is a private, browser-based PDF, ebook, and photo conversion studio. Conversion happens on the device: files are not uploaded to a server and the converter does not require an account or external API.
 
@@ -11,7 +11,11 @@ PageForge is a private, browser-based PDF, ebook, and photo conversion studio. C
 - Text + photos, text-only, and photos-only ebook editions; sections that become empty are removed automatically.
 - Password entry for protected PDFs. Publisher DRM is not removed.
 
-Photos, PDFs, EPUBs, MOBIs, and AZW3 books all enter through one upload box. PDFs use one Download-as selector for PDF, EPUB, MOBI, AZW3, AZM3, JPEG, PNG, and WebP. PDF cleanup proposals are color coded: blue reference, green range, purple blank + similar, and red for other marked pages. Confirmation immediately removes marked pages from the working preview and prepares a cleaned result without auto-downloading. `PageForge-Local 2.2.1.html` is the versioned standalone offline file and intentionally omits the support section. `index.html` is the website edition and includes Richard Jiang’s GitHub link and the optional Bitcoin support panel.
+Photos, PDFs, EPUBs, MOBIs, and AZW3 books all enter through one upload box. PDFs use one Download-as selector for PDF, EPUB, MOBI, AZW3, AZM3, JPEG, PNG, and WebP. PDF cleanup proposals are color coded: blue reference, green range, purple blank + similar, and red for other marked pages. Confirmation immediately removes marked pages from the working preview and prepares a cleaned result without auto-downloading.
+
+Version 3.0 uses mutually exclusive PDF page conversion: text-only pages become reflowable text, pages containing artwork are preserved once as page images, and empty pages are omitted from ebook exports. MOBI, AZW3, AZM3, EPUB, and ebook-to-PDF exports no longer insert visible synthetic page or section headings. EPUB navigation titles are preserved separately from body content.
+
+`PageForge-Local 3.0.html` is the versioned standalone offline file and intentionally omits the support section. `index.html` is the website edition and includes Richard Jiang’s GitHub link and the optional Bitcoin support panel.
 
 ## Run locally
 
