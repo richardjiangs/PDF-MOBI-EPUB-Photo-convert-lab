@@ -4,7 +4,7 @@ import test from "node:test";
 import { calculateBlankPercentage } from "../offline-src/blankness.mjs";
 import { calculateFingerprintSimilarity, matchesBlankAndSimilar } from "../offline-src/similarity.mjs";
 import { buildPdfFromKeptPages } from "../offline-src/pdf-pages.mjs";
-import { buildVisibleTableOfContents, chapterNavigationLabel, composeLegacyBookBody, createPdfBookChapter, detectChapterTitle, finalizePdfBookChapters, tableOfContentsEntries, wrapKf8Chapter, wrapMobiChapter } from "../offline-src/book-content.mjs";
+import { buildVisibleTableOfContents, chapterNavigationLabel, composeLegacyBookBody, createPdfBookChapter, detectChapterTitle, finalizePdfBookChapters, removeBookPages, tableOfContentsEntries, wrapKf8Chapter, wrapMobiChapter } from "../offline-src/book-content.mjs";
 import { PDFDocument } from "pdf-lib";
 
 test("blank-page analysis returns exact percentages for threshold marking", () => {
@@ -103,6 +103,12 @@ test("ebook writers do not inject visible page or section headings", () => {
   assert.equal(chapterNavigationLabel({ title: "Original Chapter", navLabel: "Section 9" }, 8), "Original Chapter");
 });
 
+test("confirmed ebook page deletion keeps only checked reader pages", () => {
+  const chapters = [{ title: "Cover" }, { title: "One" }, { title: "Two" }, { title: "Three" }];
+  assert.deepEqual(removeBookPages(chapters, new Set([1, 3])).map(chapter => chapter.title), ["One", "Three"]);
+  assert.deepEqual(removeBookPages(chapters, new Set()), chapters);
+});
+
 async function render() {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
   workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
@@ -166,6 +172,12 @@ test("ships separate standalone and website editions", async () => {
   assert.doesNotMatch(output, /Go to PDF format conversion/i);
   assert.doesNotMatch(output, /id="pdf-jump-convert"/i);
   assert.match(output, /Find blank or blank \+ similar pages/i);
+  assert.match(output, /id="book-pages"/i);
+  assert.match(output, /id="book-delete-range"/i);
+  assert.match(output, /id="book-analyze"/i);
+  assert.match(output, /id="book-find-similar"/i);
+  assert.match(output, /id="book-delete-unchecked"/i);
+  assert.match(output, /previews load on scroll/i);
   assert.match(output, /Confirm &amp; prepare cleaned result|Confirm & prepare cleaned result/i);
   assert.doesNotMatch(output, /class="tabs"/i);
   assert.match(output, /value="azw3"/i);
@@ -177,7 +189,11 @@ test("ships separate standalone and website editions", async () => {
   assert.match(website, /data:image\/png;base64,[A-Za-z0-9+/]{100}/i);
   assert.match(source, /showSaveFilePicker/);
   assert.match(source, /showDirectoryPicker/);
-  assert.match(source, /Inventory every packaged image/);
+  assert.match(source, /async function materializeBook/);
+  assert.match(source, /function mapWithConcurrency/);
+  assert.match(source, /Checking packaged EPUB artwork/);
+  assert.match(source, /previews load only as you scroll/);
+  assert.match(source, /removeBookPages/);
   assert.match(source, /Incorrect password/);
   assert.match(source, /function buildAzw3/);
   assert.match(source, /chapters = chapters\.filter/);
