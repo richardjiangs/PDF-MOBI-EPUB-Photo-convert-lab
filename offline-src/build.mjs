@@ -33,5 +33,6 @@ await writeFile(resolve(root, "outputs/PageForge.html"), standaloneHtml);
 await writeFile(resolve(root, "public/PageForge.html"), standaloneHtml);
 await writeFile(resolve(root, "index.html"), websiteHtml);
 await writeFile(resolve(root, "public/index.html"), websiteHtml);
+await writeFile(resolve(root, "public/PageForge-Website.html"), websiteHtml);
 await writeFile(resolve(root, "work/pageforge.bundle.js"), bundle);
 console.log(`Built PageForge.html (${(standaloneHtml.length / 1048576).toFixed(2)} MB) and index.html (${(websiteHtml.length / 1048576).toFixed(2)} MB)`);

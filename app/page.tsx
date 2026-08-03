@@ -3,7 +3,7 @@ export default function Home() {
     <main className="preview-shell">
       <iframe
         title="PageForge Local preview"
-        src="/index.html"
+        src="/PageForge-Website.html"
         className="preview-frame"
       />
     </main>

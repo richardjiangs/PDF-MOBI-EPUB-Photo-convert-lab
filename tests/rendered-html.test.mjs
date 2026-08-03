@@ -19,20 +19,22 @@ test("server-renders the PageForge preview wrapper", async () => {
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
   const html = await response.text();
   assert.match(html, /<title>PageForge Local<\/title>/i);
-  assert.match(html, /<iframe[^>]+src="\/index\.html"/i);
+  assert.match(html, /<iframe[^>]+src="\/PageForge-Website\.html"/i);
   assert.match(html, /PageForge Local preview/i);
 });
 
 test("ships separate standalone and website editions", async () => {
-  const [output, served, website, publicWebsite, source] = await Promise.all([
+  const [output, served, website, publicWebsite, hostedWebsite, source] = await Promise.all([
     readFile(new URL("../outputs/PageForge.html", import.meta.url), "utf8"),
     readFile(new URL("../public/PageForge.html", import.meta.url), "utf8"),
     readFile(new URL("../index.html", import.meta.url), "utf8"),
     readFile(new URL("../public/index.html", import.meta.url), "utf8"),
+    readFile(new URL("../public/PageForge-Website.html", import.meta.url), "utf8"),
     readFile(new URL("../offline-src/app.js", import.meta.url), "utf8"),
   ]);
   assert.equal(served, output);
   assert.equal(publicWebsite, website);
+  assert.equal(hostedWebsite, website);
   assert.match(output, /PAGEFORGE LOCAL/);
   assert.match(output, /id="photo-input"[^>]+multiple/i);
   assert.match(output, /id="pdf-password"/i);
