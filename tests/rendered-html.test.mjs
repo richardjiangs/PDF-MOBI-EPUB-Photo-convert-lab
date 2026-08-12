@@ -4,7 +4,7 @@ import test from "node:test";
 import { calculateBlankPercentage } from "../offline-src/blankness.mjs";
 import { calculateFingerprintSimilarity, matchesBlankAndSimilar } from "../offline-src/similarity.mjs";
 import { buildPdfFromKeptPages } from "../offline-src/pdf-pages.mjs";
-import { buildNestedTocList, buildVisibleTableOfContents, chapterNavigationLabel, composeLegacyBookBody, createPdfBookChapter, detectChapterTitle, finalizeAutomaticTocChapters, finalizePdfBookChapters, isGenericNavigationLabel, removeBookPages, tableOfContentsEntries, tableOfContentsTree, wrapKf8Chapter, wrapMobiChapter } from "../offline-src/book-content.mjs";
+import { buildNestedTocList, buildVisibleTableOfContents, chapterNavigationLabel, composeLegacyBookBody, createPdfBookChapter, detectChapter, detectChapterTitle, finalizeAutomaticTocChapters, finalizePdfBookChapters, isGenericNavigationLabel, removeBookPages, tableOfContentsEntries, tableOfContentsTree, wrapKf8Chapter, wrapMobiChapter } from "../offline-src/book-content.mjs";
 import { PDFDocument } from "pdf-lib";
 
 test("blank-page analysis returns exact percentages for threshold marking", () => {
@@ -69,6 +69,19 @@ test("offline chapter recognition builds concise navigation without changing cha
   ]), "A Quiet Beginning");
   assert.equal(detectChapterTitle([{ text: "Ordinary body copy ends here.", fontSize: 11 }]), "");
   assert.equal(detectChapterTitle([{ text: "Contents", fontSize: 24 }, { text: "Chapter 1 ........ 3", fontSize: 11 }]), "");
+  assert.deepEqual(detectChapter([
+    { text: "Part II", fontSize: 22 },
+    { text: "The Long Winter", fontSize: 18 },
+    { text: "Body copy begins here.", fontSize: 11 },
+  ]), { title: "Part II: The Long Winter", level: 1, confidence: 1 });
+  assert.deepEqual(detectChapter([{ text: "Chapter 7", fontSize: 22 }, { text: "Crossing the River", fontSize: 18 }, { text: "Body copy.", fontSize: 11 }]), { title: "Chapter 7: Crossing the River", level: 2, confidence: 1 });
+  assert.equal(detectChapter([{ text: "Section 3 — Evidence", fontSize: 18 }]).level, 3);
+  assert.equal(detectChapter([{ text: "Capítulo 4", fontSize: 18 }, { text: "El regreso", fontSize: 15 }]).title, "Capítulo 4: El regreso");
+  assert.equal(detectChapter([{ text: "第十二章", fontSize: 18 }, { text: "归途", fontSize: 15 }]).title, "第十二章: 归途");
+  assert.equal(detectChapter([{ text: "7", fontSize: 18 }, { text: "The Crossing", fontSize: 18 }, { text: "Body copy.", fontSize: 11 }]).title, "7: The Crossing");
+  assert.equal(detectChapter([{ text: "Chapter Seven", fontSize: 18 }, { text: "The Crossing", fontSize: 15 }]).title, "Chapter Seven: The Crossing");
+  assert.equal(detectChapter([{ text: "An Unnumbered Beginning", headingLevel: 2 }]).level, 2);
+  assert.equal(detectChapterTitle([{ text: "Table of Contents", headingLevel: 1 }, { text: "Chapter 1 ....... 3" }, { text: "Chapter 2 ....... 9" }, { text: "Chapter 3 ....... 14" }]), "");
 
   const chapters = finalizePdfBookChapters([
     createPdfBookChapter({ pageNo: 1, lines: [{ text: "Chapter 1 — Start", fontSize: 20 }, { text: "Body one.", fontSize: 11 }] }),
@@ -115,6 +128,20 @@ test("automatic ebook contents is conservative and manual hierarchy overrides it
   assert.deepEqual(tableOfContentsEntries(recognized).map(entry => entry.label), ["Chapter 1 — Arrival", "Chapter 2 — Return"]);
   const fallback = finalizeAutomaticTocChapters([{ title: "Preface" }, { title: "", navLabel: "Section 2" }]);
   assert.deepEqual(tableOfContentsEntries(fallback).map(entry => entry.label), ["Preface"]);
+  const poorPublisherNav = finalizeAutomaticTocChapters([
+    { title: "", navLabel: "Section 1", tocSource: "publisher" },
+    { title: "Chapter 1", navLabel: "Section 2", tocSource: "detected", tocLevel: 2 },
+    { title: "Chapter 2", navLabel: "Section 3", tocSource: "detected", tocLevel: 2 },
+  ]);
+  assert.deepEqual(tableOfContentsEntries(poorPublisherNav).map(entry => entry.label), ["Chapter 1", "Chapter 2"]);
+  const repeatedHeader = finalizeAutomaticTocChapters([
+    { title: "Running Book Title", tocSource: "detected" },
+    { title: "Running Book Title", tocSource: "detected" },
+    { title: "Chapter 1", tocSource: "detected", tocLevel: 2 },
+    { title: "Running Book Title", tocSource: "detected" },
+    { title: "Chapter 2", tocSource: "detected", tocLevel: 2 },
+  ]);
+  assert.deepEqual(tableOfContentsEntries(repeatedHeader).map(entry => entry.label), ["Chapter 1", "Chapter 2"]);
 
   const manual = finalizeAutomaticTocChapters([
     { title: "Wrong automatic title", tocSource: "publisher" },
@@ -154,7 +181,7 @@ test("server-renders the PageForge preview wrapper", async () => {
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
   const html = await response.text();
-  assert.match(html, /<title>PageForge Local 3\.0<\/title>/i);
+  assert.match(html, /<title>PageForge Local 3\.2<\/title>/i);
   assert.match(html, /<iframe[^>]+src="\/PageForge-Website\.html"/i);
   assert.match(html, /PageForge Local preview/i);
 });
@@ -162,7 +189,7 @@ test("server-renders the PageForge preview wrapper", async () => {
 test("ships separate standalone and website editions", async () => {
   const [output, versionedOutput, served, website, publicWebsite, hostedWebsite, githubPages, source, template] = await Promise.all([
     readFile(new URL("../outputs/PageForge.html", import.meta.url), "utf8"),
-    readFile(new URL("../outputs/PageForge-Local%203.0.html", import.meta.url), "utf8"),
+    readFile(new URL("../outputs/PageForge-Local%203.2.html", import.meta.url), "utf8"),
     readFile(new URL("../public/PageForge.html", import.meta.url), "utf8"),
     readFile(new URL("../index.html", import.meta.url), "utf8"),
     readFile(new URL("../public/index.html", import.meta.url), "utf8"),
@@ -177,7 +204,7 @@ test("ships separate standalone and website editions", async () => {
   assert.equal(hostedWebsite, website);
   assert.equal(githubPages, website);
   assert.match(output, /PAGEFORGE LOCAL/);
-  assert.match(output, /PAGEFORGE LOCAL 3\.0/);
+  assert.match(output, /PAGEFORGE LOCAL 3\.2/);
   assert.match(output, /id="unified-input"[^>]+multiple/i);
   assert.match(output, /Drop photos, a PDF, or an ebook here/i);
   assert.doesNotMatch(output, /id="(?:photo|pdf|book)-drop"/i);
@@ -197,7 +224,7 @@ test("ships separate standalone and website editions", async () => {
   assert.match(output, /Publisher navigation is preferred/i);
   assert.match(output, /Download as selected format/i);
   assert.match(output, /Mark range in orange/i);
-  assert.match(output, /Automatic offline table of contents: ON/i);
+  assert.match(output, /Automatic offline table of contents: SMART 3\.2/i);
   assert.match(output, /id="book-toc"/i);
   assert.match(output, /id="book-chapter-level-1"/i);
   assert.match(output, /id="book-chapter-level-2"/i);
