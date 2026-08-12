@@ -6,12 +6,12 @@ import { initMobiFile, initKf8File } from "@lingo-reader/mobi-parser";
 import { calculateBlankPercentage } from "./blankness.mjs";
 import { calculateFingerprintSimilarity, matchesBlankAndSimilar } from "./similarity.mjs";
 import { buildPdfFromKeptPages } from "./pdf-pages.mjs";
-import { buildVisibleTableOfContents, chapterNavigationLabel, cleanChapterTitle, composeLegacyBookBody, createPdfBookChapter, finalizeAutomaticTocChapters, finalizePdfBookChapters, isGenericNavigationLabel, removeBookPages, tableOfContentsEntries, wrapKf8Chapter, wrapMobiChapter } from "./book-content.mjs";
+import { buildNestedTocList, buildVisibleTableOfContents, chapterNavigationLabel, cleanChapterTitle, composeLegacyBookBody, createPdfBookChapter, finalizeAutomaticTocChapters, finalizePdfBookChapters, removeBookPages, tableOfContentsEntries, tableOfContentsTree, wrapKf8Chapter, wrapMobiChapter } from "./book-content.mjs";
 
 const $ = (s, root = document) => root.querySelector(s);
 const $$ = (s, root = document) => [...root.querySelectorAll(s)];
 const enc = new TextEncoder();
-const state = { photos: [], pdfFile: null, pdfBytes: null, pdf: null, pdfPending: null, pdfPassword: "", pdfBlankness: new Map(), pdfBlanknessJobs: new Map(), pdfFingerprints: new Map(), pdfReferencePage: null, pdfResult: null, pdfBlankScanId: 0, bookFile: null, book: null, bookPending: null, bookPassword: "", bookBlankness: new Map(), bookAnalysisJobs: new Map(), bookFingerprints: new Map(), bookReferencePage: null, bookPageObserver: null, bookBlankScanId: 0 };
+const state = { photos: [], pdfFile: null, pdfBytes: null, pdf: null, pdfPending: null, pdfPassword: "", pdfBlankness: new Map(), pdfBlanknessJobs: new Map(), pdfFingerprints: new Map(), pdfReferencePage: null, pdfResult: null, pdfBlankScanId: 0, pdfChapterMarkLevel: 0, pdfChapterMarks: new Map(), bookFile: null, book: null, bookPending: null, bookPassword: "", bookBlankness: new Map(), bookAnalysisJobs: new Map(), bookFingerprints: new Map(), bookReferencePage: null, bookPageObserver: null, bookBlankScanId: 0, bookChapterMarkLevel: 0 };
 const workerSource = $("#pdf-worker-source").textContent;
 pdfjsLib.GlobalWorkerOptions.workerSrc = URL.createObjectURL(new Blob([workerSource], { type: "text/javascript" }));
 
@@ -54,6 +54,20 @@ function askAboutMarkedPages(kind, count) {
     dialog.showModal();
   });
 }
+const chapterLevelName = level => ["", "first-class", "second-class", "third-class"][level] || "chapter";
+function syncChapterCard(card, level = 0, title = "") {
+  card.classList.remove("chapter-marked", "chapter-level-1", "chapter-level-2", "chapter-level-3");
+  if (level) card.classList.add("chapter-marked", `chapter-level-${level}`);
+  const badge = $(".chapter-badge", card), input = $(".chapter-title-input", card);
+  if (badge) badge.textContent = level ? `${chapterLevelName(level)} chapter` : "Not in manual contents";
+  if (input && title && input !== document.activeElement) input.value = title;
+}
+function setChapterMarkMode(kind, level) {
+  const key = kind === "pdf" ? "pdfChapterMarkLevel" : "bookChapterMarkLevel", next = state[key] === level ? 0 : level; state[key] = next;
+  for (let value = 1; value <= 3; value++) $(`#${kind}-chapter-level-${value}`).classList.toggle("active", next === value);
+  const statusLabel = $(`#${kind}-chapter-mark-status`); statusLabel.textContent = next ? `${chapterLevelName(next)} marking is on · click page previews · click this level again to stop.` : "Chapter marking is off.";
+}
+for (const kind of ["pdf", "book"]) for (let level = 1; level <= 3; level++) $(`#${kind}-chapter-level-${level}`).addEventListener("click", () => setChapterMarkMode(kind, level));
 function downloadBlob(blob, filename) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -230,7 +244,7 @@ async function loadPdf(file, password = "", existingBytes = null) {
     showWorkspaceMode("pdf");
     status(password ? "Unlocking PDF locally" : "Reading PDF locally", 8); const bytes = existingBytes || new Uint8Array(await file.arrayBuffer());
     const task = pdfjsLib.getDocument({ data: bytes.slice(), password: password || undefined }); const pdf = await task.promise, pdfMetadata = await pdf.getMetadata().catch(() => ({})), detectedAuthor = cleanChapterTitle(pdfMetadata?.info?.Author);
-    state.pdfFile = file; state.pdfBytes = bytes; state.pdf = pdf; state.pdfPending = null; state.pdfPassword = password; state.pdfBlankness.clear(); state.pdfBlanknessJobs.clear(); state.pdfFingerprints.clear(); state.pdfReferencePage = null; state.pdfResult = null; state.pdfBlankScanId++;
+    state.pdfFile = file; state.pdfBytes = bytes; state.pdf = pdf; state.pdfPending = null; state.pdfPassword = password; state.pdfBlankness.clear(); state.pdfBlanknessJobs.clear(); state.pdfFingerprints.clear(); state.pdfReferencePage = null; state.pdfResult = null; state.pdfBlankScanId++; state.pdfChapterMarks.clear(); state.pdfChapterMarkLevel = 0; setChapterMarkMode("pdf", 0);
     invalidatePdfResult(); $("#pdf-reference-status").textContent = "Click a page preview to make it the blue reference."; $("#pdf-find-similar").disabled = true;
     $("#pdf-direct-name").value = safeName(file.name.replace(/\.pdf$/i, "")); $("#pdf-direct-author").value = detectedAuthor; $("#pdf-result-author").value = "";
     $("#pdf-password-box").classList.remove("show"); $("#pdf-password").value = "";
@@ -254,7 +268,7 @@ $("#pdf-reset").addEventListener("click", () => {
   const resetBookToo = state.book?.sourceType === "pdf" || state.bookFile === state.pdfFile;
   thumbObserver?.disconnect();
   state.pdf?.destroy?.();
-  state.pdfFile = state.pdfBytes = state.pdf = state.pdfPending = null; state.pdfPassword = ""; state.pdfBlankness.clear(); state.pdfBlanknessJobs.clear(); state.pdfFingerprints.clear(); state.pdfReferencePage = null; state.pdfResult = null; state.pdfBlankScanId++;
+  state.pdfFile = state.pdfBytes = state.pdf = state.pdfPending = null; state.pdfPassword = ""; state.pdfBlankness.clear(); state.pdfBlanknessJobs.clear(); state.pdfFingerprints.clear(); state.pdfReferencePage = null; state.pdfResult = null; state.pdfBlankScanId++; state.pdfChapterMarks.clear(); state.pdfChapterMarkLevel = 0; setChapterMarkMode("pdf", 0);
   $("#pdf-pages").textContent = "";
   $("#pdf-queue").classList.remove("show");
   $("#pdf-password-box").classList.remove("show"); $("#pdf-password").value = "";
@@ -265,16 +279,30 @@ $("#pdf-reset").addEventListener("click", () => {
   resetWorkspaceDisplay();
 });
 let thumbObserver;
+function updatePdfChapterSummary() {
+  const count = state.pdfChapterMarks.size, active = state.pdfChapterMarkLevel, label = $("#pdf-chapter-mark-status");
+  label.textContent = `${active ? `${chapterLevelName(active)} marking is on` : "Chapter marking is off"} · ${count} manual chapter${count === 1 ? "" : "s"}.`;
+}
+function markPdfChapter(pageNo) {
+  const level = state.pdfChapterMarkLevel; if (!level) return selectPdfReference(pageNo);
+  const card = $(`.card[data-page="${pageNo}"]`, $("#pdf-pages")), current = state.pdfChapterMarks.get(pageNo), input = card && $(".chapter-title-input", card);
+  if (current?.level === level) state.pdfChapterMarks.delete(pageNo); else state.pdfChapterMarks.set(pageNo, { level, title: cleanChapterTitle(input?.value) || `Page ${pageNo}` });
+  const mark = state.pdfChapterMarks.get(pageNo); syncChapterCard(card, mark?.level || 0, mark?.title || `Page ${pageNo}`); updatePdfChapterSummary(); invalidatePdfResult();
+}
 function renderPdfPlaceholders() {
   const host = $("#pdf-pages"); host.textContent = ""; thumbObserver?.disconnect();
   thumbObserver = new IntersectionObserver(entries => entries.filter(x => x.isIntersecting).forEach(x => { thumbObserver.unobserve(x.target); renderPdfThumb(x.target); }), { rootMargin: "500px" });
   for (let n = 1; n <= state.pdf.numPages; n++) {
     const card = document.createElement("div"); card.className = "card"; card.dataset.page = n;
-    card.innerHTML = `<button class="thumb pdf-reference-button" type="button" aria-pressed="false" title="Use page ${n} as the similarity reference"><span class="page-no">PAGE ${n}</span></button><div class="card-meta"><span class="filename">Page ${n}</span><span class="page-no">PDF</span></div><label class="page-keep"><input class="page-keep-check" type="checkbox" checked aria-label="Keep page ${n}"><span>Keep page</span></label><div class="blank-score">Calculating blank %…</div><div class="similarity-score">Similarity not analyzed</div>`;
-    $(".pdf-reference-button", card).addEventListener("click", () => selectPdfReference(n));
+    const chapterMark = state.pdfChapterMarks.get(n);
+    card.innerHTML = `<button class="thumb pdf-reference-button" type="button" aria-pressed="false" title="Use page ${n} for the active chapter or similarity tool"><span class="page-no">PAGE ${n}</span></button><div class="card-meta"><span class="filename">Page ${n}</span><span class="page-no">PDF</span></div><div class="chapter-editor"><span class="chapter-badge">Not in manual contents</span><input class="chapter-title-input" maxlength="140" value="${escapeHtml(chapterMark?.title || `Page ${n}`)}" aria-label="Chapter title for PDF page ${n}"></div><label class="page-keep"><input class="page-keep-check" type="checkbox" checked aria-label="Keep page ${n}"><span>Keep page</span></label><div class="blank-score">Calculating blank %…</div><div class="similarity-score">Similarity not analyzed</div>`;
+    syncChapterCard(card, chapterMark?.level || 0, chapterMark?.title || `Page ${n}`);
+    $(".pdf-reference-button", card).addEventListener("click", () => markPdfChapter(n));
+    $(".chapter-title-input", card).addEventListener("input", event => { const mark = state.pdfChapterMarks.get(n); if (mark) { mark.title = cleanChapterTitle(event.target.value) || `Page ${n}`; updatePdfChapterSummary(); invalidatePdfResult(); } });
     $(".page-keep-check", card).addEventListener("change", e => { clearPageMark(card); card.classList.toggle("page-removed", !e.target.checked); if (!e.target.checked) card.dataset.mark = "manual"; invalidatePdfResult(); updatePdfConfirmation(); });
     host.append(card); thumbObserver.observe(card);
   }
+  updatePdfChapterSummary();
   void schedulePdfBlanknessScan(state.pdf);
 }
 async function renderPdfThumb(card) {
@@ -355,7 +383,7 @@ function invalidatePdfResult() {
 async function preparePdfWithDeleted(deleted) {
   if (!deleted.size) throw new Error("No pages are marked for deletion. Enter a range or untick one or more page cards.");
   if (deleted.size === state.pdf.numPages) throw new Error("A PDF needs at least one page. Keep one or more pages.");
-  status("Rebuilding PDF without the marked pages", 25); const originalPdf = state.pdf, keep = Array.from({ length: originalPdf.numPages }, (_, i) => i + 1).filter(n => !deleted.has(n)); let bytes, flattened = false;
+  status("Rebuilding PDF without the marked pages", 25); const originalPdf = state.pdf, keep = Array.from({ length: originalPdf.numPages }, (_, i) => i + 1).filter(n => !deleted.has(n)), remappedChapterMarks = new Map(); keep.forEach((oldPage, newIndex) => { const mark = state.pdfChapterMarks.get(oldPage); if (mark) remappedChapterMarks.set(newIndex + 1, { ...mark }); }); let bytes, flattened = false;
   try {
     if (state.pdfPassword) throw new Error("Protected document requires flattening");
     bytes = await buildPdfFromKeptPages(state.pdfBytes, keep);
@@ -368,7 +396,7 @@ async function preparePdfWithDeleted(deleted) {
   const cleanedFile = new File([cleanedBytes], `${cleanedName}.pdf`, { type: "application/pdf", lastModified: Date.now() });
 
   state.pdfFile = cleanedFile; state.pdfBytes = cleanedBytes; state.pdf = cleanedPdf; state.pdfPending = null; state.pdfPassword = "";
-  state.pdfBlankness.clear(); state.pdfBlanknessJobs.clear(); state.pdfFingerprints.clear(); state.pdfReferencePage = null; state.pdfBlankScanId++;
+  state.pdfBlankness.clear(); state.pdfBlanknessJobs.clear(); state.pdfFingerprints.clear(); state.pdfReferencePage = null; state.pdfBlankScanId++; state.pdfChapterMarks = remappedChapterMarks;
   state.pdfResult = { bytes: cleanedBytes, keep, deleted: new Set(deleted), flattened, stem };
   $("#pdf-reference-status").textContent = "Click a page preview to make it the blue reference."; $("#pdf-find-similar").disabled = true;
   $("#pdf-delete-range").value = ""; $("#pdf-direct-name").value = cleanedName;
@@ -428,25 +456,32 @@ $("#pdf-delete-unchecked").addEventListener("click", async () => { try { await p
 // EPUB / MOBI / PDF conversion
 function detectHtmlChapterTitle(doc) {
   const acceptable = value => { const text = cleanChapterTitle(value); return text.length >= 2 && text.length <= 140 && !/^(?:contents|table of contents)$/i.test(text) ? text : ""; };
-  const selectors = ["[epub\\:type~='title']", "[role='heading']", "h1", "h2", "h3", "h4", "h5", "h6", ".chapter-title", ".chapter-heading", ".part-title", ".book-title", "[class*='chapter'][class*='title']", "[id*='chapter'][id*='title']"];
+  const explicitPattern = /^(?:(?:chapter|part|book|section)\s+(?:\d+|[ivxlcdm]+|[a-z])\b|prologue|epilogue|introduction|preface|foreword|afterword|conclusion|appendix\b|第.{1,12}[章节篇部]\b)/i;
+  const selectors = ["[epub\\:type~='title']", "h1", "[role='heading'][aria-level='1']", ".chapter-title", ".chapter-heading", ".part-title", "[class*='chapter'][class*='title']", "[id*='chapter'][id*='title']"];
   for (const selector of selectors) { let node; try { node = doc.querySelector(selector); } catch {} const title = acceptable(node?.textContent); if (title) return title; }
-  const titleElement = acceptable(doc.querySelector("title")?.textContent); if (titleElement && !/\.(?:x?html?|xml)$/i.test(titleElement)) return titleElement;
+  const titleElement = acceptable(doc.querySelector("title")?.textContent); if (titleElement && explicitPattern.test(titleElement)) return titleElement;
   const early = $$('p,div,span', doc.body).slice(0, 18).map(node => ({ text: acceptable(node.textContent), size: parseFloat(node.style?.fontSize) || Number(node.getAttribute?.("size")) || 0 })).filter(item => item.text);
-  const explicit = early.find(item => /^(?:(?:chapter|part|book|section)\s+(?:\d+|[ivxlcdm]+|[a-z])\b|prologue|epilogue|introduction|preface|foreword|afterword|conclusion|appendix\b|第.{1,12}[章节篇部]\b)/i.test(item.text)); if (explicit) return explicit.text;
+  const explicit = early.find(item => explicitPattern.test(item.text)); if (explicit) return explicit.text;
   const sizes = early.map(item => item.size).filter(Boolean).sort((a, b) => a - b), median = sizes.length ? sizes[Math.floor(sizes.length / 2)] : 0;
   const sized = early.find(item => item.size && item.size >= Math.max(16, median * 1.25) && item.text.length <= 90 && !/[.!?。！？]$/.test(item.text)); return sized?.text || "";
 }
 function applyDetectedChapterTitle(chapter, doc) {
-  const detected = detectHtmlChapterTitle(doc); if (!chapter.title && detected) { chapter.title = detected; chapter.navLabel = detected; chapter.includeInToc = true; } return detected;
+  const detected = detectHtmlChapterTitle(doc); if (!chapter.title && detected) { chapter.title = detected; chapter.navLabel = detected; chapter.includeInToc = false; chapter.tocSource = "detected"; chapter.tocLevel = 1; } return detected;
 }
 function automaticTocEntries(chapters) { return tableOfContentsEntries(finalizeAutomaticTocChapters(chapters)); }
 function updateBookTocPreview(book = state.book) {
   const list = $("#book-toc-list"), statusLabel = $("#book-toc-status"); if (!list || !statusLabel) return; list.textContent = "";
   if (!book?.chapters?.length || book.sourceType === "pdf") { statusLabel.textContent = "Generated during book export"; return; }
-  const entries = automaticTocEntries(book.chapters), named = entries.filter(entry => !isGenericNavigationLabel(entry.label)).length;
-  entries.slice(0, 12).forEach(entry => { const item = document.createElement("li"); item.textContent = entry.label; list.append(item); });
-  if (entries.length > 12) { const item = document.createElement("li"); item.className = "book-toc-more"; item.textContent = `+ ${entries.length - 12} more entries`; list.append(item); }
-  const analyzed = book.chapters.filter(chapter => chapter.loaded).length; statusLabel.textContent = `${entries.length} entries · ${named} named · ${analyzed}/${book.chapters.length} pages analyzed`;
+  const entries = automaticTocEntries(book.chapters), tree = tableOfContentsTree(entries), manual = book.chapters.some(chapter => Number(chapter.manualTocLevel) >= 1), append = (parent, nodes) => { for (const node of nodes) { const item = document.createElement("li"); if (node.children.length) { const details = document.createElement("details"), summary = document.createElement("summary"), children = document.createElement("ol"); summary.textContent = node.label; details.append(summary); append(children, node.children); details.append(children); item.append(details); } else { item.className = "toc-leaf"; item.textContent = node.label; } parent.append(item); } }; append(list, tree);
+  const analyzed = book.chapters.filter(chapter => chapter.loaded).length; statusLabel.textContent = `${manual ? "MANUAL" : "AUTO"} · ${entries.length} entries · ${analyzed}/${book.chapters.length} pages analyzed`;
+}
+function markBookChapter(pageNo) {
+  const level = state.bookChapterMarkLevel; if (!level) return selectBookReference(pageNo);
+  const chapter = state.book?.chapters?.[pageNo - 1], card = $(`.card[data-page="${pageNo}"]`, $("#book-pages")); if (!chapter || !card) return;
+  if (Number(chapter.manualTocLevel) === level) { delete chapter.manualTocLevel; delete chapter.manualTocTitle; }
+  else { chapter.manualTocLevel = level; chapter.manualTocTitle = cleanChapterTitle($(".chapter-title-input", card)?.value) || chapterNavigationLabel(chapter, pageNo - 1); }
+  syncChapterCard(card, Number(chapter.manualTocLevel) || 0, chapter.manualTocTitle || chapterNavigationLabel(chapter, pageNo - 1)); updateBookTocPreview();
+  const count = state.book.chapters.filter(item => Number(item.manualTocLevel) >= 1).length; $("#book-chapter-mark-status").textContent = `${chapterLevelName(level)} marking is on · ${count} manual chapter${count === 1 ? "" : "s"} · manual marks replace auto.`;
 }
 function safeBookRenderDocument(html) {
   const doc = new DOMParser().parseFromString(html || "", "text/html");
@@ -498,7 +533,7 @@ async function loadBook(file, password = "") {
     if (type === "epub") book = await parseEpub(file);
     else if (type === "pdf") book = await pdfAsBook(file, false, password);
     else book = await parseMobi(file);
-    state.book = book; state.bookPending = null; state.bookPassword = password; $("#book-password-box").classList.remove("show"); $("#book-password").value = ""; showBookDetails(book, file); if (book.sourceType !== "pdf") renderBookPlaceholders(); status("Book ready · previews load only as you scroll", 100, true);
+    state.book = book; state.bookPending = null; state.bookPassword = password; state.bookChapterMarkLevel = 0; setChapterMarkMode("book", 0); $("#book-password-box").classList.remove("show"); $("#book-password").value = ""; showBookDetails(book, file); if (book.sourceType !== "pdf") renderBookPlaceholders(); status("Book ready · complete page previews load locally", 100, true);
   } catch (e) {
     if (file.name.toLowerCase().endsWith(".pdf") && isPasswordError(e)) {
       state.book = null; state.bookPending = { file }; state.bookFile = file;
@@ -514,7 +549,7 @@ $("#book-password").addEventListener("keydown", e => { if (e.key === "Enter") $(
 $("#book-reset").addEventListener("click", () => {
   if ((state.book?.sourceType === "pdf" && state.pdf) || (state.pdfPending && state.bookFile === state.pdfFile)) { $("#pdf-reset").click(); return; }
   state.bookPageObserver?.disconnect(); state.book?.dispose?.(); state.book?.pdf?.destroy?.();
-  state.bookFile = state.book = state.bookPending = null; state.bookPassword = "";
+  state.bookFile = state.book = state.bookPending = null; state.bookPassword = ""; state.bookChapterMarkLevel = 0; setChapterMarkMode("book", 0);
   state.bookBlankness.clear(); state.bookAnalysisJobs.clear(); state.bookFingerprints.clear(); state.bookReferencePage = null; state.bookBlankScanId++;
   $("#book-summary").classList.remove("show");
   $("#book-page-queue").classList.remove("show"); $("#book-pages").textContent = "";
@@ -557,8 +592,10 @@ function renderBookPlaceholders() {
   state.bookPageObserver = new IntersectionObserver(entries => entries.filter(entry => entry.isIntersecting).forEach(entry => { state.bookPageObserver.unobserve(entry.target); renderBookThumb(entry.target); }), { rootMargin: "500px" });
   book.chapters.forEach((chapter, index) => {
     const pageNo = index + 1, label = chapterNavigationLabel(chapter, index), card = document.createElement("div"); card.className = "card"; card.dataset.page = pageNo;
-    card.innerHTML = `<button class="thumb pdf-reference-button" type="button" aria-pressed="false" title="Use ebook page ${pageNo} as the similarity reference"><span class="page-no">PAGE ${pageNo}</span></button><div class="card-meta"><span class="filename" title="${escapeHtml(label)}">${escapeHtml(label)}</span><span class="page-no">${escapeHtml(book.sourceType.toUpperCase())}</span></div><label class="page-keep"><input class="page-keep-check" type="checkbox" checked aria-label="Keep ebook page ${pageNo}"><span>Keep page</span></label><div class="blank-score">Calculating blank %…</div><div class="similarity-score">Similarity not analyzed</div>`;
-    $(".pdf-reference-button", card).addEventListener("click", () => selectBookReference(pageNo));
+    card.innerHTML = `<button class="thumb pdf-reference-button" type="button" aria-pressed="false" title="Use ebook page ${pageNo} for the active chapter or similarity tool"><span class="page-no">PAGE ${pageNo}</span></button><div class="card-meta"><span class="filename" title="${escapeHtml(label)}">${escapeHtml(label)}</span><span class="page-no">${escapeHtml(book.sourceType.toUpperCase())}</span></div><div class="chapter-editor"><span class="chapter-badge">Not in manual contents</span><input class="chapter-title-input" maxlength="140" value="${escapeHtml(chapter.manualTocTitle || label)}" aria-label="Chapter title for ebook page ${pageNo}"></div><label class="page-keep"><input class="page-keep-check" type="checkbox" checked aria-label="Keep ebook page ${pageNo}"><span>Keep page</span></label><div class="blank-score">Calculating blank %…</div><div class="similarity-score">Similarity not analyzed</div>`;
+    syncChapterCard(card, Number(chapter.manualTocLevel) || 0, chapter.manualTocTitle || label);
+    $(".pdf-reference-button", card).addEventListener("click", () => markBookChapter(pageNo));
+    $(".chapter-title-input", card).addEventListener("input", event => { if (Number(chapter.manualTocLevel) >= 1) { chapter.manualTocTitle = cleanChapterTitle(event.target.value) || label; updateBookTocPreview(); } });
     $(".page-keep-check", card).addEventListener("change", event => { clearBookPageMark(card); card.classList.toggle("page-removed", !event.target.checked); if (!event.target.checked) card.dataset.mark = "manual"; updateBookConfirmation(); });
     host.append(card); state.bookPageObserver.observe(card);
   });
@@ -567,17 +604,19 @@ function renderBookPlaceholders() {
 async function renderBookThumb(card) {
   const book = state.book, pageNo = +card.dataset.page;
   try {
-    const chapter = await loadBookChapter(book, pageNo - 1); if (book !== state.book || !card.isConnected) return;
-    const doc = new DOMParser().parseFromString(chapter.html || "", "text/html"), image = doc.body.querySelector("img[src]"), text = cleanChapterTitle(doc.body.textContent).slice(0, 260), thumb = $(".thumb", card);
-    if (image?.getAttribute("src")) { const preview = document.createElement("img"); preview.alt = ""; preview.src = image.getAttribute("src"); thumb.replaceChildren(preview); }
-    else { const preview = document.createElement("span"); preview.className = "book-text-preview"; preview.textContent = text || "Blank ebook page"; thumb.replaceChildren(preview); }
-    const label = chapterNavigationLabel(chapter, pageNo - 1), filename = $(".filename", card); filename.textContent = label; filename.title = label; updateBookTocPreview(book);
+    const chapter = await loadBookChapter(book, pageNo - 1); if (book !== state.book || !card.isConnected) return; await getBookPageAnalysis(pageNo);
+    const label = chapterNavigationLabel(chapter, pageNo - 1), filename = $(".filename", card), titleInput = $(".chapter-title-input", card); filename.textContent = label; filename.title = label; if (!chapter.manualTocLevel && titleInput !== document.activeElement) titleInput.value = label; updateBookTocPreview(book);
   } catch (error) { const thumb = $(".thumb", card); if (thumb) thumb.textContent = "Preview unavailable"; console.warn(error); }
 }
 function selectBookReference(pageNo) {
   state.bookReferencePage = pageNo;
   $$(".card", $("#book-pages")).forEach(card => { const selected = +card.dataset.page === pageNo; card.classList.toggle("page-reference", selected); $(".pdf-reference-button", card).setAttribute("aria-pressed", String(selected)); });
   setBookPageKept(pageNo, true); $("#book-find-similar").disabled = false; $("#book-reference-status").textContent = `Ebook page ${pageNo} is the blue reference. Similarity-only matches are red; blank + similar matches are purple.`; updateBookConfirmation();
+}
+function paintBookPreview(pageNo, sourceCanvas) {
+  const card = $(`.card[data-page="${pageNo}"]`, $("#book-pages")), thumb = card && $(".thumb", card); if (!thumb || !sourceCanvas) return;
+  const canvas = document.createElement("canvas"), width = 180, height = 240; canvas.className = "book-page-preview"; canvas.width = width; canvas.height = height;
+  const context = canvas.getContext("2d", { alpha: false }); context.fillStyle = "#fff"; context.fillRect(0, 0, width, height); context.drawImage(sourceCanvas, 0, 0, width, height); thumb.replaceChildren(canvas);
 }
 async function getBookPageAnalysis(pageNo) {
   if (state.bookBlankness.has(pageNo) && state.bookFingerprints.has(pageNo)) return { blankness: state.bookBlankness.get(pageNo), fingerprint: state.bookFingerprints.get(pageNo) };
@@ -590,7 +629,7 @@ async function getBookPageAnalysis(pageNo) {
     const context = canvas.getContext("2d", { alpha: false }), pixels = context.getImageData(0, 0, canvas.width, canvas.height).data, blankness = calculateBlankPercentage(pixels), sample = document.createElement("canvas"); sample.width = sample.height = 48;
     const sampleContext = sample.getContext("2d", { alpha: false }); sampleContext.fillStyle = "#fff"; sampleContext.fillRect(0, 0, 48, 48); sampleContext.drawImage(canvas, 0, 0, 48, 48); const samplePixels = sampleContext.getImageData(0, 0, 48, 48).data, fingerprint = new Uint8Array(48 * 48 * 3);
     for (let source = 0, target = 0; source < samplePixels.length; source += 4) { fingerprint[target++] = samplePixels[source]; fingerprint[target++] = samplePixels[source + 1]; fingerprint[target++] = samplePixels[source + 2]; }
-    if (state.book === book) { state.bookBlankness.set(pageNo, blankness); state.bookFingerprints.set(pageNo, fingerprint); const label = $(`.card[data-page="${pageNo}"] .blank-score`, $("#book-pages")); if (label) label.textContent = `${blankness.toFixed(1)}% blank`; updateBookTocPreview(book); }
+    if (state.book === book) { state.bookBlankness.set(pageNo, blankness); state.bookFingerprints.set(pageNo, fingerprint); paintBookPreview(pageNo, canvas); const label = $(`.card[data-page="${pageNo}"] .blank-score`, $("#book-pages")); if (label) label.textContent = `${blankness.toFixed(1)}% blank`; updateBookTocPreview(book); }
     return { blankness, fingerprint };
   })().finally(() => state.bookAnalysisJobs.delete(pageNo));
   state.bookAnalysisJobs.set(pageNo, job); return job;
@@ -670,18 +709,18 @@ async function parseEpub(file) {
   const navItem = [...manifest.values()].find(item => item.properties.split(/\s+/).includes("nav"));
   if (navItem) {
     const navMarkup = await zip.file(navItem.href)?.async("text");
-    if (navMarkup) { const navDoc = new DOMParser().parseFromString(navMarkup, "text/html"); for (const link of $$("nav a[href]", navDoc)) { const href = normalizePath(dirname(navItem.href) + link.getAttribute("href").split("#")[0]), label = cleanChapterTitle(link.textContent); if (href && label && !tocTitles.has(href)) tocTitles.set(href, label); } }
+    if (navMarkup) { const navDoc = new DOMParser().parseFromString(navMarkup, "text/html"); for (const link of $$("nav a[href]", navDoc)) { const href = normalizePath(dirname(navItem.href) + link.getAttribute("href").split("#")[0]), label = cleanChapterTitle(link.textContent); let level = 1, parent = link.closest("li")?.parentElement?.closest("li"); while (parent) { level++; parent = parent.parentElement?.closest("li"); } if (href && label && !tocTitles.has(href)) tocTitles.set(href, { label, level: Math.min(3, level) }); } }
   }
   const ncxId = opf.querySelector("spine")?.getAttribute("toc"), ncxItem = ncxId ? manifest.get(ncxId) : [...manifest.values()].find(item => item.type === "application/x-dtbncx+xml");
   if (ncxItem) {
     const ncxMarkup = await zip.file(ncxItem.href)?.async("text");
-    if (ncxMarkup) { const ncxDoc = new DOMParser().parseFromString(ncxMarkup, "application/xml"); for (const point of $$("navPoint", ncxDoc)) { const raw = point.querySelector("content")?.getAttribute("src"), label = cleanChapterTitle(point.querySelector("navLabel text")?.textContent); const href = raw && normalizePath(dirname(ncxItem.href) + raw.split("#")[0]); if (href && label && !tocTitles.has(href)) tocTitles.set(href, label); } }
+    if (ncxMarkup) { const ncxDoc = new DOMParser().parseFromString(ncxMarkup, "application/xml"); for (const point of $$("navPoint", ncxDoc)) { const raw = point.querySelector("content")?.getAttribute("src"), label = cleanChapterTitle(point.querySelector("navLabel text")?.textContent); let level = 1, parent = point.parentElement?.closest("navPoint"); while (parent) { level++; parent = parent.parentElement?.closest("navPoint"); } const href = raw && normalizePath(dirname(ncxItem.href) + raw.split("#")[0]); if (href && label && !tocTitles.has(href)) tocTitles.set(href, { label, level: Math.min(3, level) }); } }
   }
-  for (let i = 0; i < refs.length; i++) { const item = manifest.get(refs[i].getAttribute("idref")); if (!item || !zip.file(item.href)) continue; const chapterTitle = tocTitles.get(item.href) || ""; chapters.push({ title: chapterTitle, navLabel: chapterTitle || `Section ${i + 1}`, includeInToc: true, html: "", loaded: false, kind: "epub-html", path: item.href, assets: [] }); }
+  for (let i = 0; i < refs.length; i++) { const item = manifest.get(refs[i].getAttribute("idref")); if (!item || !zip.file(item.href)) continue; const tocEntry = tocTitles.get(item.href), chapterTitle = tocEntry?.label || ""; chapters.push({ title: chapterTitle, navLabel: chapterTitle || `Section ${i + 1}`, includeInToc: Boolean(tocEntry), tocSource: tocEntry ? "publisher" : "unknown", tocLevel: tocEntry?.level || 1, html: "", loaded: false, kind: "epub-html", path: item.href, assets: [] }); }
   const imageItems = [...manifest.values()].filter(item => item.type.startsWith("image/") || mimeFromPath(item.href).startsWith("image/"));
   const coverId = opf.querySelector('meta[name="cover"]')?.getAttribute("content"), guideHref = opf.querySelector('guide reference[type~="cover"]')?.getAttribute("href"), cover = [...manifest.values()].find(x => x.properties.split(/\s+/).includes("cover-image")) || manifest.get(coverId) || [...manifest.values()].find(x => /cover/i.test(x.id || "") && x.type.startsWith("image/"));
   const coverPath = cover?.href || (guideHref ? normalizePath(base + guideHref) : "");
-  if (coverPath && !chapters.some(chapter => chapter.path === coverPath) && zip.file(coverPath)) chapters.unshift({ title: "Cover", navLabel: "Cover", includeInToc: true, html: "", loaded: false, kind: mimeFromPath(coverPath).startsWith("image/") ? "epub-image" : "epub-html", path: coverPath, assets: [] });
+  if (coverPath && !chapters.some(chapter => chapter.path === coverPath) && zip.file(coverPath)) chapters.unshift({ title: "Cover", navLabel: "Cover", includeInToc: false, tocSource: "cover", tocLevel: 1, html: "", loaded: false, kind: mimeFromPath(coverPath).startsWith("image/") ? "epub-image" : "epub-html", path: coverPath, assets: [] });
   if (!chapters.length) throw new Error("No readable EPUB chapters were found.");
   const assetCache = new Map(), book = { sourceType: "epub", title, author, chapters, assets: [], visualCount: imageItems.length, lazy: true, source: { zip, assetCache, assetPaths: imageItems.map(item => item.href) } };
   book.loadChapter = async (chapter, index) => {
@@ -695,9 +734,9 @@ async function parseEpub(file) {
 async function parseMobi(file) {
   let mobi; const sourceExt = file.name.toLowerCase().split(".").pop(), preferKf8 = sourceExt === "azw3" || sourceExt === "azm3";
   try { mobi = preferKf8 ? await initKf8File(file) : await initMobiFile(file); } catch { mobi = preferKf8 ? await initMobiFile(file) : await initKf8File(file); }
-  const meta = mobi.getMetadata(), spine = mobi.getSpine(), chapters = [], tocTitles = new Map(), visitToc = items => { for (const item of items || []) { const resolved = mobi.resolveHref?.(item.href), label = cleanChapterTitle(item.label); if (resolved?.id != null && label && !tocTitles.has(String(resolved.id))) tocTitles.set(String(resolved.id), label); visitToc(item.children); } }; visitToc(mobi.getToc?.());
-  for (let i = 0; i < spine.length; i++) { const chapterTitle = tocTitles.get(String(spine[i].id)) || ""; chapters.push({ title: chapterTitle, navLabel: chapterTitle || `Section ${i + 1}`, includeInToc: true, html: "", loaded: false, kind: "mobi-html", mobiId: spine[i].id, assets: [] }); }
-  const coverUrl = mobi.getCoverImage?.(); if (coverUrl) chapters.unshift({ title: "Cover", navLabel: "Cover", includeInToc: true, html: "", loaded: false, kind: "mobi-cover", sourceUrl: coverUrl, assets: [] });
+  const meta = mobi.getMetadata(), spine = mobi.getSpine(), chapters = [], tocTitles = new Map(), visitToc = (items, level = 1) => { for (const item of items || []) { const resolved = mobi.resolveHref?.(item.href), label = cleanChapterTitle(item.label); if (resolved?.id != null && label && !tocTitles.has(String(resolved.id))) tocTitles.set(String(resolved.id), { label, level: Math.min(3, level) }); visitToc(item.children, level + 1); } }; visitToc(mobi.getToc?.());
+  for (let i = 0; i < spine.length; i++) { const tocEntry = tocTitles.get(String(spine[i].id)), chapterTitle = tocEntry?.label || ""; chapters.push({ title: chapterTitle, navLabel: chapterTitle || `Section ${i + 1}`, includeInToc: Boolean(tocEntry), tocSource: tocEntry ? "publisher" : "unknown", tocLevel: tocEntry?.level || 1, html: "", loaded: false, kind: "mobi-html", mobiId: spine[i].id, assets: [] }); }
+  const coverUrl = mobi.getCoverImage?.(); if (coverUrl) chapters.unshift({ title: "Cover", navLabel: "Cover", includeInToc: false, tocSource: "cover", tocLevel: 1, html: "", loaded: false, kind: "mobi-cover", sourceUrl: coverUrl, assets: [] });
   if (!chapters.length) { mobi.destroy(); throw new Error("No readable MOBI/KF8 sections were found."); }
   const authorValues = Array.isArray(meta.author) ? meta.author : meta.author ? [meta.author] : [], book = { sourceType: sourceExt === "azm3" ? "azm3" : preferKf8 ? "azw3" : "mobi", title: meta.title || file.name.replace(/\.[^.]+$/, ""), author: authorValues.join(", "), chapters, assets: [], visualCount: undefined, lazy: true, source: { mobi } };
   book.loadChapter = async (chapter, index) => {
@@ -749,7 +788,8 @@ async function pdfAsBook(file, renderPages = true, password = "", existingBytes 
     const data = hasVisualArt ? await blobToDataURL(await renderPdfPage(pdf, i, 1.45, "jpeg", .9)) : "", chapter = createPdfBookChapter({ pageNo: i, lines, hasVisualArt, imageData: data });
     if (chapter) { book.assets.push(...chapter.assets); book.chapters.push(chapter); } await tick();
   }
-  book.chapters = finalizePdfBookChapters(book.chapters); return book;
+  if (state.pdfChapterMarks.size) book.chapters = finalizeAutomaticTocChapters(book.chapters.map(chapter => { const mark = state.pdfChapterMarks.get(chapter.sourcePageNo); return mark ? { ...chapter, manualTocLevel: mark.level, manualTocTitle: mark.title, tocSource: "manual" } : chapter; }));
+  else book.chapters = finalizePdfBookChapters(book.chapters); return book;
 }
 function filterHtml(html, mode) {
   if (mode === "all") return html;
@@ -897,8 +937,8 @@ async function buildEpub(book) {
     for (const img of $$("img[src^='data:']", doc)) { const { bytes, mime } = dataUrlToBytes(img.getAttribute("src")); const ext = extFromMime(mime); const name = `image-${++imageNo}.${ext}`; zip.file(`OEBPS/images/${name}`, bytes); img.setAttribute("src", `../images/${name}`); imageItems.push(`<item id="img${imageNo}" href="images/${name}" media-type="${mime}"/>`); }
     $$('script,iframe,object,embed', doc).forEach(x => x.remove()); const id = `ch${i + 1}`, name = `chapter-${i + 1}.xhtml`, label = chapterNavigationLabel(book.chapters[i], i); zip.file(`OEBPS/text/${name}`, xhtmlDocument(label, doc.body.innerHTML)); chapterItems.push(`<item id="${id}" href="text/${name}" media-type="application/xhtml+xml"/>`); status(`Packaging section ${i + 1} of ${book.chapters.length}`, 20 + (i / book.chapters.length) * 60); await tick();
   }
-  const navLinks = tableOfContentsEntries(book.chapters).map(entry => `<li><a href="text/chapter-${entry.index + 1}.xhtml">${escapeHtml(entry.label)}</a></li>`);
-  const uid = `urn:uuid:${crypto.randomUUID()}`; zip.file("OEBPS/nav.xhtml", xhtmlDocument("Contents", `<nav epub:type="toc" xmlns:epub="http://www.idpf.org/2007/ops"><h1>Contents</h1><ol>${navLinks.join("")}</ol></nav>`));
+  const navLinks = buildNestedTocList(tableOfContentsEntries(book.chapters), entry => `text/chapter-${entry.index + 1}.xhtml`);
+  const uid = `urn:uuid:${crypto.randomUUID()}`; zip.file("OEBPS/nav.xhtml", xhtmlDocument("Contents", `<nav epub:type="toc" xmlns:epub="http://www.idpf.org/2007/ops"><h1>Contents</h1>${navLinks}</nav>`));
   zip.file("OEBPS/content.opf", `<?xml version="1.0" encoding="UTF-8"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="uid">${uid}</dc:identifier><dc:title>${escapeHtml(book.title)}</dc:title><dc:creator>${escapeHtml(book.author || "")}</dc:creator><dc:language>en</dc:language><meta property="dcterms:modified">${new Date().toISOString().replace(/\.\d{3}Z$/, "Z")}</meta></metadata><manifest><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>${chapterItems.join("")}${imageItems.join("")}</manifest><spine>${book.chapters.map((_, i) => `<itemref idref="ch${i + 1}"/>`).join("")}</spine></package>`);
   return zip.generateAsync({ type: "blob", mimeType: "application/epub+zip", compression: "DEFLATE", compressionOptions: { level: 6 } }, p => status("Compressing EPUB", 80 + p.percent * .18));
 }

@@ -4,7 +4,7 @@ import test from "node:test";
 import { calculateBlankPercentage } from "../offline-src/blankness.mjs";
 import { calculateFingerprintSimilarity, matchesBlankAndSimilar } from "../offline-src/similarity.mjs";
 import { buildPdfFromKeptPages } from "../offline-src/pdf-pages.mjs";
-import { buildVisibleTableOfContents, chapterNavigationLabel, composeLegacyBookBody, createPdfBookChapter, detectChapterTitle, finalizeAutomaticTocChapters, finalizePdfBookChapters, isGenericNavigationLabel, removeBookPages, tableOfContentsEntries, wrapKf8Chapter, wrapMobiChapter } from "../offline-src/book-content.mjs";
+import { buildNestedTocList, buildVisibleTableOfContents, chapterNavigationLabel, composeLegacyBookBody, createPdfBookChapter, detectChapterTitle, finalizeAutomaticTocChapters, finalizePdfBookChapters, isGenericNavigationLabel, removeBookPages, tableOfContentsEntries, tableOfContentsTree, wrapKf8Chapter, wrapMobiChapter } from "../offline-src/book-content.mjs";
 import { PDFDocument } from "pdf-lib";
 
 test("blank-page analysis returns exact percentages for threshold marking", () => {
@@ -85,7 +85,7 @@ test("offline chapter recognition builds concise navigation without changing cha
     createPdfBookChapter({ pageNo: 4, lines: ["Plain text."] }),
     createPdfBookChapter({ pageNo: 5, lines: ["More plain text."] }),
   ]);
-  assert.deepEqual(tableOfContentsEntries(fallback).map(entry => entry.label), ["Page 4", "Page 5"]);
+  assert.deepEqual(tableOfContentsEntries(fallback).map(entry => entry.label), ["Page 4"]);
   const legacy = composeLegacyBookBody({ chapters, sections: ["FIRST BODY", "SECOND BODY"], separator: "<mbp:pagebreak/>" });
   assert.match(legacy, /^<nav class="pageforge-toc">/);
   assert.match(legacy, /Contents[\s\S]*FIRST BODY<mbp:pagebreak\/>SECOND BODY/);
@@ -103,18 +103,33 @@ test("ebook writers do not inject visible page or section headings", () => {
   assert.equal(chapterNavigationLabel({ title: "Original Chapter", navLabel: "Section 9" }, 8), "Original Chapter");
 });
 
-test("automatic ebook contents prefers recognized chapters and safely falls back", () => {
+test("automatic ebook contents is conservative and manual hierarchy overrides it", () => {
   assert.equal(isGenericNavigationLabel("Section 12"), true);
   assert.equal(isGenericNavigationLabel("Chapter 12"), false);
   const recognized = finalizeAutomaticTocChapters([
-    { title: "Cover", navLabel: "Cover" },
-    { title: "Chapter 1 — Arrival", navLabel: "Chapter 1 — Arrival" },
+    { title: "Cover", navLabel: "Cover", tocSource: "cover" },
+    { title: "Chapter 1 — Arrival", navLabel: "Chapter 1 — Arrival", tocSource: "detected" },
     { title: "", navLabel: "Section 3" },
-    { title: "Chapter 2 — Return", navLabel: "Chapter 2 — Return" },
+    { title: "Chapter 2 — Return", navLabel: "Chapter 2 — Return", tocSource: "detected" },
   ]);
   assert.deepEqual(tableOfContentsEntries(recognized).map(entry => entry.label), ["Chapter 1 — Arrival", "Chapter 2 — Return"]);
   const fallback = finalizeAutomaticTocChapters([{ title: "Preface" }, { title: "", navLabel: "Section 2" }]);
-  assert.deepEqual(tableOfContentsEntries(fallback).map(entry => entry.label), ["Preface", "Section 2"]);
+  assert.deepEqual(tableOfContentsEntries(fallback).map(entry => entry.label), ["Preface"]);
+
+  const manual = finalizeAutomaticTocChapters([
+    { title: "Wrong automatic title", tocSource: "publisher" },
+    { manualTocLevel: 1, manualTocTitle: "Part One" },
+    { manualTocLevel: 2, manualTocTitle: "Chapter One" },
+    { manualTocLevel: 3, manualTocTitle: "A smaller section" },
+    { manualTocLevel: 1, manualTocTitle: "Part Two" },
+  ]);
+  const entries = tableOfContentsEntries(manual);
+  assert.deepEqual(entries.map(entry => [entry.label, entry.level]), [["Part One", 1], ["Chapter One", 2], ["A smaller section", 3], ["Part Two", 1]]);
+  assert.deepEqual(tableOfContentsTree(entries).map(node => [node.label, node.children.map(child => [child.label, child.children.map(grandchild => grandchild.label)])]), [["Part One", [["Chapter One", ["A smaller section"]]]], ["Part Two", []]]);
+  const nested = buildNestedTocList(entries, entry => `text/chapter-${entry.index + 1}.xhtml`);
+  assert.match(nested, /Part One[\s\S]*<ol>[\s\S]*Chapter One[\s\S]*<ol>[\s\S]*A smaller section/);
+  assert.match(nested, /pageforge-toc-expand[^>]*> ›<\/span>/);
+  assert.doesNotMatch(nested, /Wrong automatic title/);
 });
 
 test("confirmed ebook page deletion keeps only checked reader pages", () => {
@@ -179,11 +194,17 @@ test("ships separate standalone and website editions", async () => {
   assert.match(output, /id="pdf-direct-author"/i);
   assert.match(output, /id="pdf-result-author"/i);
   assert.match(output, /recognize chapter headings offline/i);
-  assert.match(output, /recognizes chapter wording and relative heading size on this device/i);
+  assert.match(output, /Publisher navigation is preferred/i);
   assert.match(output, /Download as selected format/i);
   assert.match(output, /Mark range in orange/i);
   assert.match(output, /Automatic offline table of contents: ON/i);
   assert.match(output, /id="book-toc"/i);
+  assert.match(output, /id="book-chapter-level-1"/i);
+  assert.match(output, /id="book-chapter-level-2"/i);
+  assert.match(output, /id="book-chapter-level-3"/i);
+  assert.match(output, /id="pdf-chapter-level-1"/i);
+  assert.match(output, /green is first class, yellow is second class, and black is third class/i);
+  assert.match(output, /complete rendered previews/i);
   assert.match(output, /id="marked-pages-dialog"/i);
   assert.match(output, /id="marked-delete-continue"/i);
   assert.match(output, /id="marked-continue"/i);
@@ -213,7 +234,7 @@ test("ships separate standalone and website editions", async () => {
   assert.match(source, /async function materializeBook/);
   assert.match(source, /function mapWithConcurrency/);
   assert.match(source, /Checking packaged EPUB artwork/);
-  assert.match(source, /previews load only as you scroll/);
+  assert.match(source, /complete page previews load locally/);
   assert.match(source, /removeBookPages/);
   assert.match(source, /Incorrect password/);
   assert.match(source, /function buildAzw3/);
@@ -235,6 +256,11 @@ test("ships separate standalone and website editions", async () => {
   assert.match(source, /tableOfContentsEntries/);
   assert.match(source, /composeLegacyBookBody/);
   assert.match(source, /buildVisibleTableOfContents/);
+  assert.match(source, /buildNestedTocList/);
+  assert.match(source, /tableOfContentsTree/);
+  assert.match(source, /function markBookChapter/);
+  assert.match(source, /function markPdfChapter/);
+  assert.match(source, /function paintBookPreview/);
   assert.match(source, /finalizeAutomaticTocChapters/);
   assert.match(source, /function safeBookRenderDocument/);
   assert.match(source, /function schedulePdfBlanknessScan/);

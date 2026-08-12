@@ -13,7 +13,7 @@ export function cleanChapterTitle(value = "") {
 }
 
 export function chapterNavigationLabel(chapter, index) {
-  return cleanChapterTitle(chapter?.title) || cleanChapterTitle(chapter?.navLabel) || `Section ${index + 1}`;
+  return cleanChapterTitle(chapter?.manualTocTitle) || cleanChapterTitle(chapter?.title) || cleanChapterTitle(chapter?.navLabel) || `Section ${index + 1}`;
 }
 
 export function isGenericNavigationLabel(value = "") {
@@ -21,9 +21,13 @@ export function isGenericNavigationLabel(value = "") {
 }
 
 export function finalizeAutomaticTocChapters(chapters = []) {
-  const recognized = chapters.map((chapter, index) => ({ chapter, index, label: chapterNavigationLabel(chapter, index) })).filter(({ chapter, label }) => cleanChapterTitle(chapter?.title) && !isGenericNavigationLabel(label) && !/^cover$/i.test(label));
-  const selected = recognized.length >= 2 ? new Set(recognized.map(entry => entry.index)) : new Set(chapters.map((_, index) => index));
-  return chapters.map((chapter, index) => ({ ...chapter, includeInToc: selected.has(index) }));
+  const manual = chapters.map((chapter, index) => ({ chapter, index })).filter(({ chapter }) => Number(chapter?.manualTocLevel) >= 1);
+  if (manual.length) return chapters.map(chapter => ({ ...chapter, includeInToc: Number(chapter.manualTocLevel) >= 1, tocLevel: Math.min(3, Math.max(1, Number(chapter.manualTocLevel) || 1)), tocSource: Number(chapter.manualTocLevel) >= 1 ? "manual" : chapter.tocSource }));
+  const publisher = chapters.map((chapter, index) => ({ chapter, index })).filter(({ chapter, index }) => chapter?.tocSource === "publisher" && !/^cover$/i.test(chapterNavigationLabel(chapter, index)));
+  if (publisher.length) return chapters.map((chapter, index) => ({ ...chapter, includeInToc: publisher.some(entry => entry.index === index), tocLevel: Math.min(3, Math.max(1, Number(chapter.tocLevel) || 1)) }));
+  const recognized = chapters.map((chapter, index) => ({ chapter, index, label: chapterNavigationLabel(chapter, index) })).filter(({ chapter, label }) => chapter?.tocSource === "detected" && cleanChapterTitle(chapter?.title) && !isGenericNavigationLabel(label) && !/^cover$/i.test(label));
+  const selected = recognized.length ? new Set(recognized.map(entry => entry.index)) : new Set(chapters.map((chapter, index) => ({ chapter, index })).filter(({ chapter, index }) => !/^cover$/i.test(chapterNavigationLabel(chapter, index))).slice(0, 1).map(entry => entry.index));
+  return chapters.map((chapter, index) => ({ ...chapter, includeInToc: selected.has(index), tocLevel: 1 }));
 }
 
 export function removeBookPages(chapters = [], deletedPages = new Set()) {
@@ -66,22 +70,40 @@ export function finalizePdfBookChapters(chapters = []) {
     const key = title.toLocaleLowerCase();
     const includeInToc = Boolean(title && !seenTitles.has(key));
     if (includeInToc) { seenTitles.add(key); foundChapter = true; }
-    return { ...chapter, title, includeInToc };
+    return { ...chapter, title, includeInToc, tocLevel: 1, tocSource: includeInToc ? "detected" : chapter.tocSource };
   });
-  return foundChapter ? finalized : finalized.map(chapter => ({ ...chapter, includeInToc: true }));
+  return foundChapter ? finalized : finalized.map((chapter, index) => ({ ...chapter, includeInToc: index === 0, tocLevel: 1, tocSource: index === 0 ? "fallback" : chapter.tocSource }));
 }
 
 export function tableOfContentsEntries(chapters = []) {
-  const selected = chapters.some(chapter => chapter?.includeInToc)
+  const hasManual = chapters.some(chapter => Number(chapter?.manualTocLevel) >= 1);
+  const selected = hasManual
+    ? chapters.map((chapter, index) => ({ chapter, index })).filter(({ chapter }) => Number(chapter.manualTocLevel) >= 1)
+    : chapters.some(chapter => chapter?.includeInToc)
     ? chapters.map((chapter, index) => ({ chapter, index })).filter(({ chapter }) => chapter.includeInToc)
     : chapters.map((chapter, index) => ({ chapter, index }));
-  return selected.map(({ chapter, index }) => ({ index, id: `pf-chapter-${index + 1}`, label: chapterNavigationLabel(chapter, index) }));
+  return selected.map(({ chapter, index }) => ({ index, id: `pf-chapter-${index + 1}`, label: chapterNavigationLabel(chapter, index), level: Math.min(3, Math.max(1, Number(hasManual ? chapter.manualTocLevel : chapter.tocLevel) || 1)) }));
+}
+
+export function tableOfContentsTree(entries = []) {
+  const roots = [], stack = [];
+  for (const entry of entries) {
+    const requested = Math.min(3, Math.max(1, Number(entry.level) || 1)), level = roots.length ? Math.min(requested, stack.length + 1) : 1, node = { ...entry, level, children: [] };
+    if (level === 1) roots.push(node); else stack[level - 2].children.push(node);
+    stack[level - 1] = node; stack.length = level;
+  }
+  return roots;
+}
+
+export function buildNestedTocList(entries = [], linkFor = entry => `#${entry.id}`) {
+  const render = nodes => `<ol>${nodes.map(node => `<li><a href="${escapeBookHtml(linkFor(node))}">${escapeBookHtml(node.label)}</a>${node.children.length ? `<span class="pageforge-toc-expand" aria-hidden="true"> ›</span>${render(node.children)}` : ""}</li>`).join("")}</ol>`;
+  return render(tableOfContentsTree(entries));
 }
 
 export function buildVisibleTableOfContents(chapters = []) {
   const entries = tableOfContentsEntries(chapters);
   if (entries.length < 2) return "";
-  return `<nav class="pageforge-toc"><h1>Contents</h1><ol>${entries.map(entry => `<li><a href="#${entry.id}">${escapeBookHtml(entry.label)}</a></li>`).join("")}</ol></nav>`;
+  return `<nav class="pageforge-toc"><h1>Contents</h1>${buildNestedTocList(entries)}</nav>`;
 }
 
 export function composeLegacyBookBody({ chapters = [], sections = [], filterMode = "all", separator = "", tocSeparator = separator } = {}) {
@@ -93,6 +115,7 @@ export function createPdfBookChapter({ pageNo, lines = [], hasVisualArt = false,
   const title = detectChapterTitle(lines), navLabel = title || `Page ${pageNo}`;
   if (hasVisualArt && imageData) {
     return {
+      sourcePageNo: pageNo,
       title,
       navLabel,
       kind: "page-image",
@@ -103,6 +126,7 @@ export function createPdfBookChapter({ pageNo, lines = [], hasVisualArt = false,
   const cleanLines = lines.map(normalizedLine).map(line => line.text).filter(Boolean);
   if (cleanLines.length) {
     return {
+      sourcePageNo: pageNo,
       title,
       navLabel,
       kind: "reflow-text",
