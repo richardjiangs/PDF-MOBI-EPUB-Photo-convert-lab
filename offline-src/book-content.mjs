@@ -16,6 +16,16 @@ export function chapterNavigationLabel(chapter, index) {
   return cleanChapterTitle(chapter?.title) || cleanChapterTitle(chapter?.navLabel) || `Section ${index + 1}`;
 }
 
+export function isGenericNavigationLabel(value = "") {
+  return /^(?:section|page)\s+\d+$/i.test(cleanChapterTitle(value));
+}
+
+export function finalizeAutomaticTocChapters(chapters = []) {
+  const recognized = chapters.map((chapter, index) => ({ chapter, index, label: chapterNavigationLabel(chapter, index) })).filter(({ chapter, label }) => cleanChapterTitle(chapter?.title) && !isGenericNavigationLabel(label) && !/^cover$/i.test(label));
+  const selected = recognized.length >= 2 ? new Set(recognized.map(entry => entry.index)) : new Set(chapters.map((_, index) => index));
+  return chapters.map((chapter, index) => ({ ...chapter, includeInToc: selected.has(index) }));
+}
+
 export function removeBookPages(chapters = [], deletedPages = new Set()) {
   return chapters.filter((_, index) => !deletedPages.has(index + 1));
 }
