@@ -4,7 +4,7 @@ import test from "node:test";
 import { calculateBlankPercentage } from "../offline-src/blankness.mjs";
 import { calculateFingerprintSimilarity, matchesBlankAndSimilar } from "../offline-src/similarity.mjs";
 import { buildPdfFromKeptPages } from "../offline-src/pdf-pages.mjs";
-import { buildVisibleTableOfContents, chapterNavigationLabel, composeLegacyBookBody, createPdfBookChapter, detectChapterTitle, finalizePdfBookChapters, removeBookPages, tableOfContentsEntries, wrapKf8Chapter, wrapMobiChapter } from "../offline-src/book-content.mjs";
+import { buildVisibleTableOfContents, chapterNavigationLabel, composeLegacyBookBody, createPdfBookChapter, detectChapterTitle, finalizeAutomaticTocChapters, finalizePdfBookChapters, isGenericNavigationLabel, removeBookPages, tableOfContentsEntries, wrapKf8Chapter, wrapMobiChapter } from "../offline-src/book-content.mjs";
 import { PDFDocument } from "pdf-lib";
 
 test("blank-page analysis returns exact percentages for threshold marking", () => {
@@ -103,6 +103,20 @@ test("ebook writers do not inject visible page or section headings", () => {
   assert.equal(chapterNavigationLabel({ title: "Original Chapter", navLabel: "Section 9" }, 8), "Original Chapter");
 });
 
+test("automatic ebook contents prefers recognized chapters and safely falls back", () => {
+  assert.equal(isGenericNavigationLabel("Section 12"), true);
+  assert.equal(isGenericNavigationLabel("Chapter 12"), false);
+  const recognized = finalizeAutomaticTocChapters([
+    { title: "Cover", navLabel: "Cover" },
+    { title: "Chapter 1 — Arrival", navLabel: "Chapter 1 — Arrival" },
+    { title: "", navLabel: "Section 3" },
+    { title: "Chapter 2 — Return", navLabel: "Chapter 2 — Return" },
+  ]);
+  assert.deepEqual(tableOfContentsEntries(recognized).map(entry => entry.label), ["Chapter 1 — Arrival", "Chapter 2 — Return"]);
+  const fallback = finalizeAutomaticTocChapters([{ title: "Preface" }, { title: "", navLabel: "Section 2" }]);
+  assert.deepEqual(tableOfContentsEntries(fallback).map(entry => entry.label), ["Preface", "Section 2"]);
+});
+
 test("confirmed ebook page deletion keeps only checked reader pages", () => {
   const chapters = [{ title: "Cover" }, { title: "One" }, { title: "Two" }, { title: "Three" }];
   assert.deepEqual(removeBookPages(chapters, new Set([1, 3])).map(chapter => chapter.title), ["One", "Three"]);
@@ -165,9 +179,16 @@ test("ships separate standalone and website editions", async () => {
   assert.match(output, /id="pdf-direct-author"/i);
   assert.match(output, /id="pdf-result-author"/i);
   assert.match(output, /recognize chapter headings offline/i);
-  assert.match(output, /Chapter names are recognized on this device/i);
+  assert.match(output, /recognizes chapter wording and relative heading size on this device/i);
   assert.match(output, /Download as selected format/i);
-  assert.match(output, /Mark range in green/i);
+  assert.match(output, /Mark range in orange/i);
+  assert.match(output, /Automatic offline table of contents: ON/i);
+  assert.match(output, /id="book-toc"/i);
+  assert.match(output, /id="marked-pages-dialog"/i);
+  assert.match(output, /id="marked-delete-continue"/i);
+  assert.match(output, /id="marked-continue"/i);
+  assert.match(output, /Blank percentages appear automatically/i);
+  assert.match(output, /orange = range/i);
   assert.match(output, /blank \+ similar/i);
   assert.doesNotMatch(output, /Go to PDF format conversion/i);
   assert.doesNotMatch(output, /id="pdf-jump-convert"/i);
@@ -213,6 +234,13 @@ test("ships separate standalone and website editions", async () => {
   assert.match(source, /finalizePdfBookChapters/);
   assert.match(source, /tableOfContentsEntries/);
   assert.match(source, /composeLegacyBookBody/);
+  assert.match(source, /buildVisibleTableOfContents/);
+  assert.match(source, /finalizeAutomaticTocChapters/);
+  assert.match(source, /function safeBookRenderDocument/);
+  assert.match(source, /function schedulePdfBlanknessScan/);
+  assert.match(source, /function scheduleBookBlanknessScan/);
+  assert.match(source, /function askAboutMarkedPages/);
+  assert.doesNotMatch(source, /\$\$\("style", doc\)\.map\(x => x\.cloneNode/);
   assert.match(source, /pdf\.setAuthor\(book\.author\)/);
   assert.match(source, /generatedBook\.author = author/);
   assert.match(source, /wrapMobiChapter/);

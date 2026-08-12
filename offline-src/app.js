@@ -6,12 +6,12 @@ import { initMobiFile, initKf8File } from "@lingo-reader/mobi-parser";
 import { calculateBlankPercentage } from "./blankness.mjs";
 import { calculateFingerprintSimilarity, matchesBlankAndSimilar } from "./similarity.mjs";
 import { buildPdfFromKeptPages } from "./pdf-pages.mjs";
-import { chapterNavigationLabel, cleanChapterTitle, composeLegacyBookBody, createPdfBookChapter, finalizePdfBookChapters, removeBookPages, tableOfContentsEntries, wrapKf8Chapter, wrapMobiChapter } from "./book-content.mjs";
+import { buildVisibleTableOfContents, chapterNavigationLabel, cleanChapterTitle, composeLegacyBookBody, createPdfBookChapter, finalizeAutomaticTocChapters, finalizePdfBookChapters, isGenericNavigationLabel, removeBookPages, tableOfContentsEntries, wrapKf8Chapter, wrapMobiChapter } from "./book-content.mjs";
 
 const $ = (s, root = document) => root.querySelector(s);
 const $$ = (s, root = document) => [...root.querySelectorAll(s)];
 const enc = new TextEncoder();
-const state = { photos: [], pdfFile: null, pdfBytes: null, pdf: null, pdfPending: null, pdfPassword: "", pdfBlankness: new Map(), pdfFingerprints: new Map(), pdfReferencePage: null, pdfResult: null, bookFile: null, book: null, bookPending: null, bookPassword: "", bookBlankness: new Map(), bookFingerprints: new Map(), bookReferencePage: null, bookPageObserver: null };
+const state = { photos: [], pdfFile: null, pdfBytes: null, pdf: null, pdfPending: null, pdfPassword: "", pdfBlankness: new Map(), pdfBlanknessJobs: new Map(), pdfFingerprints: new Map(), pdfReferencePage: null, pdfResult: null, pdfBlankScanId: 0, bookFile: null, book: null, bookPending: null, bookPassword: "", bookBlankness: new Map(), bookAnalysisJobs: new Map(), bookFingerprints: new Map(), bookReferencePage: null, bookPageObserver: null, bookBlankScanId: 0 };
 const workerSource = $("#pdf-worker-source").textContent;
 pdfjsLib.GlobalWorkerOptions.workerSrc = URL.createObjectURL(new Blob([workerSource], { type: "text/javascript" }));
 
@@ -38,7 +38,22 @@ function fail(error) {
   status(error?.message || String(error), 100, true);
 }
 const tick = () => new Promise(resolve => requestAnimationFrame(() => resolve()));
+const idleTick = (timeout = 250) => new Promise(resolve => typeof requestIdleCallback === "function" ? requestIdleCallback(() => resolve(), { timeout }) : setTimeout(resolve, 24));
 const safeName = (name, fallback = "pageforge") => (name || fallback).trim().replace(/[\\/:*?"<>|]+/g, "-").replace(/\s+/g, " ").slice(0, 100) || fallback;
+function stopBackgroundAnalysis() { state.pdfBlankScanId++; state.bookBlankScanId++; }
+function askAboutMarkedPages(kind, count) {
+  const dialog = $("#marked-pages-dialog");
+  $("#marked-pages-message").textContent = `${count} ${kind} page${count === 1 ? " is" : "s are"} still marked in red, orange, or purple. Delete them before downloading, keep them in this download, or cancel.`;
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = choice => { if (settled) return; settled = true; dialog.close(); resolve(choice); };
+    $("#marked-delete-continue").onclick = () => finish("delete");
+    $("#marked-continue").onclick = () => finish("continue");
+    $("#marked-cancel").onclick = () => finish("cancel");
+    dialog.oncancel = event => { event.preventDefault(); finish("cancel"); };
+    dialog.showModal();
+  });
+}
 function downloadBlob(blob, filename) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -215,7 +230,7 @@ async function loadPdf(file, password = "", existingBytes = null) {
     showWorkspaceMode("pdf");
     status(password ? "Unlocking PDF locally" : "Reading PDF locally", 8); const bytes = existingBytes || new Uint8Array(await file.arrayBuffer());
     const task = pdfjsLib.getDocument({ data: bytes.slice(), password: password || undefined }); const pdf = await task.promise, pdfMetadata = await pdf.getMetadata().catch(() => ({})), detectedAuthor = cleanChapterTitle(pdfMetadata?.info?.Author);
-    state.pdfFile = file; state.pdfBytes = bytes; state.pdf = pdf; state.pdfPending = null; state.pdfPassword = password; state.pdfBlankness.clear(); state.pdfFingerprints.clear(); state.pdfReferencePage = null; state.pdfResult = null;
+    state.pdfFile = file; state.pdfBytes = bytes; state.pdf = pdf; state.pdfPending = null; state.pdfPassword = password; state.pdfBlankness.clear(); state.pdfBlanknessJobs.clear(); state.pdfFingerprints.clear(); state.pdfReferencePage = null; state.pdfResult = null; state.pdfBlankScanId++;
     invalidatePdfResult(); $("#pdf-reference-status").textContent = "Click a page preview to make it the blue reference."; $("#pdf-find-similar").disabled = true;
     $("#pdf-direct-name").value = safeName(file.name.replace(/\.pdf$/i, "")); $("#pdf-direct-author").value = detectedAuthor; $("#pdf-result-author").value = "";
     $("#pdf-password-box").classList.remove("show"); $("#pdf-password").value = "";
@@ -239,7 +254,7 @@ $("#pdf-reset").addEventListener("click", () => {
   const resetBookToo = state.book?.sourceType === "pdf" || state.bookFile === state.pdfFile;
   thumbObserver?.disconnect();
   state.pdf?.destroy?.();
-  state.pdfFile = state.pdfBytes = state.pdf = state.pdfPending = null; state.pdfPassword = ""; state.pdfBlankness.clear(); state.pdfFingerprints.clear(); state.pdfReferencePage = null; state.pdfResult = null;
+  state.pdfFile = state.pdfBytes = state.pdf = state.pdfPending = null; state.pdfPassword = ""; state.pdfBlankness.clear(); state.pdfBlanknessJobs.clear(); state.pdfFingerprints.clear(); state.pdfReferencePage = null; state.pdfResult = null; state.pdfBlankScanId++;
   $("#pdf-pages").textContent = "";
   $("#pdf-queue").classList.remove("show");
   $("#pdf-password-box").classList.remove("show"); $("#pdf-password").value = "";
@@ -255,11 +270,12 @@ function renderPdfPlaceholders() {
   thumbObserver = new IntersectionObserver(entries => entries.filter(x => x.isIntersecting).forEach(x => { thumbObserver.unobserve(x.target); renderPdfThumb(x.target); }), { rootMargin: "500px" });
   for (let n = 1; n <= state.pdf.numPages; n++) {
     const card = document.createElement("div"); card.className = "card"; card.dataset.page = n;
-    card.innerHTML = `<button class="thumb pdf-reference-button" type="button" aria-pressed="false" title="Use page ${n} as the similarity reference"><span class="page-no">PAGE ${n}</span></button><div class="card-meta"><span class="filename">Page ${n}</span><span class="page-no">PDF</span></div><label class="page-keep"><input class="page-keep-check" type="checkbox" checked aria-label="Keep page ${n}"><span>Keep page</span></label><div class="blank-score">Not analyzed</div><div class="similarity-score">Similarity not analyzed</div>`;
+    card.innerHTML = `<button class="thumb pdf-reference-button" type="button" aria-pressed="false" title="Use page ${n} as the similarity reference"><span class="page-no">PAGE ${n}</span></button><div class="card-meta"><span class="filename">Page ${n}</span><span class="page-no">PDF</span></div><label class="page-keep"><input class="page-keep-check" type="checkbox" checked aria-label="Keep page ${n}"><span>Keep page</span></label><div class="blank-score">Calculating blank %…</div><div class="similarity-score">Similarity not analyzed</div>`;
     $(".pdf-reference-button", card).addEventListener("click", () => selectPdfReference(n));
     $(".page-keep-check", card).addEventListener("change", e => { clearPageMark(card); card.classList.toggle("page-removed", !e.target.checked); if (!e.target.checked) card.dataset.mark = "manual"; invalidatePdfResult(); updatePdfConfirmation(); });
     host.append(card); thumbObserver.observe(card);
   }
+  void schedulePdfBlanknessScan(state.pdf);
 }
 async function renderPdfThumb(card) {
   try { const page = await state.pdf.getPage(+card.dataset.page); const base = page.getViewport({ scale: 1 }); const scale = 180 / base.width; const viewport = page.getViewport({ scale }); const canvas = document.createElement("canvas"); canvas.width = Math.ceil(viewport.width); canvas.height = Math.ceil(viewport.height); await page.render({ canvasContext: canvas.getContext("2d"), viewport, canvas }).promise; $(".thumb", card).replaceChildren(canvas); page.cleanup(); } catch {}
@@ -281,12 +297,20 @@ async function flattenPdfPages(pdf, keep) {
 }
 async function getPageBlankness(pageNo) {
   if (state.pdfBlankness.has(pageNo)) return state.pdfBlankness.get(pageNo);
-  const page = await state.pdf.getPage(pageNo), base = page.getViewport({ scale: 1 }), scale = Math.min(.45, 420 / Math.max(base.width, base.height)), viewport = page.getViewport({ scale });
-  const canvas = document.createElement("canvas"); canvas.width = Math.max(1, Math.ceil(viewport.width)); canvas.height = Math.max(1, Math.ceil(viewport.height));
-  const ctx = canvas.getContext("2d", { alpha: false }); ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, canvas.width, canvas.height); await page.render({ canvasContext: ctx, viewport, canvas }).promise; page.cleanup();
-  const pixels = ctx.getImageData(0, 0, canvas.width, canvas.height).data, score = calculateBlankPercentage(pixels); state.pdfBlankness.set(pageNo, score);
-  const label = $(`.card[data-page="${pageNo}"] .blank-score`, $("#pdf-pages")); if (label) label.textContent = `${score.toFixed(1)}% blank`;
-  return score;
+  if (state.pdfBlanknessJobs.has(pageNo)) return state.pdfBlanknessJobs.get(pageNo);
+  const pdf = state.pdf, job = (async () => {
+    const page = await pdf.getPage(pageNo), base = page.getViewport({ scale: 1 }), scale = Math.min(.45, 420 / Math.max(base.width, base.height)), viewport = page.getViewport({ scale });
+    const canvas = document.createElement("canvas"); canvas.width = Math.max(1, Math.ceil(viewport.width)); canvas.height = Math.max(1, Math.ceil(viewport.height));
+    const ctx = canvas.getContext("2d", { alpha: false }); ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, canvas.width, canvas.height); await page.render({ canvasContext: ctx, viewport, canvas }).promise; page.cleanup();
+    const pixels = ctx.getImageData(0, 0, canvas.width, canvas.height).data, score = calculateBlankPercentage(pixels);
+    if (state.pdf === pdf) { state.pdfBlankness.set(pageNo, score); const label = $(`.card[data-page="${pageNo}"] .blank-score`, $("#pdf-pages")); if (label) label.textContent = `${score.toFixed(1)}% blank`; }
+    return score;
+  })().finally(() => state.pdfBlanknessJobs.delete(pageNo));
+  state.pdfBlanknessJobs.set(pageNo, job); return job;
+}
+async function schedulePdfBlanknessScan(pdf) {
+  if (!pdf) return; const scanId = ++state.pdfBlankScanId; await idleTick(600);
+  for (let pageNo = 1; pageNo <= pdf.numPages; pageNo++) { if (scanId !== state.pdfBlankScanId || state.pdf !== pdf) return; try { await getPageBlankness(pageNo); } catch {} await idleTick(); }
 }
 async function getPageFingerprint(pageNo) {
   if (state.pdfFingerprints.has(pageNo)) return state.pdfFingerprints.get(pageNo);
@@ -344,7 +368,7 @@ async function preparePdfWithDeleted(deleted) {
   const cleanedFile = new File([cleanedBytes], `${cleanedName}.pdf`, { type: "application/pdf", lastModified: Date.now() });
 
   state.pdfFile = cleanedFile; state.pdfBytes = cleanedBytes; state.pdf = cleanedPdf; state.pdfPending = null; state.pdfPassword = "";
-  state.pdfBlankness.clear(); state.pdfFingerprints.clear(); state.pdfReferencePage = null;
+  state.pdfBlankness.clear(); state.pdfBlanknessJobs.clear(); state.pdfFingerprints.clear(); state.pdfReferencePage = null; state.pdfBlankScanId++;
   state.pdfResult = { bytes: cleanedBytes, keep, deleted: new Set(deleted), flattened, stem };
   $("#pdf-reference-status").textContent = "Click a page preview to make it the blue reference."; $("#pdf-find-similar").disabled = true;
   $("#pdf-delete-range").value = ""; $("#pdf-direct-name").value = cleanedName;
@@ -358,7 +382,7 @@ async function preparePdfWithDeleted(deleted) {
 }
 $("#pdf-delete").addEventListener("click", async () => {
   try {
-    const pages = parseRange($("#pdf-delete-range").value, state.pdf.numPages); if (!pages.length) throw new Error("Enter one or more page numbers to mark."); invalidatePdfResult(); pages.forEach(pageNo => setPageKept(pageNo, false, "range")); updatePdfConfirmation(); status(`${pages.length} range page${pages.length === 1 ? "" : "s"} marked in green · confirm before removal`, 100, true);
+    const pages = parseRange($("#pdf-delete-range").value, state.pdf.numPages); if (!pages.length) throw new Error("Enter one or more page numbers to mark."); invalidatePdfResult(); pages.forEach(pageNo => setPageKept(pageNo, false, "range")); updatePdfConfirmation(); status(`${pages.length} range page${pages.length === 1 ? "" : "s"} marked in orange · confirm before removal`, 100, true);
   } catch (e) { fail(e); }
 });
 $("#pdf-analyze").addEventListener("click", async () => {
@@ -402,6 +426,53 @@ $("#pdf-find-similar").addEventListener("click", async () => {
 $("#pdf-delete-unchecked").addEventListener("click", async () => { try { await preparePdfWithDeleted(uncheckedPdfPages()); } catch (e) { fail(e); } });
 
 // EPUB / MOBI / PDF conversion
+function detectHtmlChapterTitle(doc) {
+  const acceptable = value => { const text = cleanChapterTitle(value); return text.length >= 2 && text.length <= 140 && !/^(?:contents|table of contents)$/i.test(text) ? text : ""; };
+  const selectors = ["[epub\\:type~='title']", "[role='heading']", "h1", "h2", "h3", "h4", "h5", "h6", ".chapter-title", ".chapter-heading", ".part-title", ".book-title", "[class*='chapter'][class*='title']", "[id*='chapter'][id*='title']"];
+  for (const selector of selectors) { let node; try { node = doc.querySelector(selector); } catch {} const title = acceptable(node?.textContent); if (title) return title; }
+  const titleElement = acceptable(doc.querySelector("title")?.textContent); if (titleElement && !/\.(?:x?html?|xml)$/i.test(titleElement)) return titleElement;
+  const early = $$('p,div,span', doc.body).slice(0, 18).map(node => ({ text: acceptable(node.textContent), size: parseFloat(node.style?.fontSize) || Number(node.getAttribute?.("size")) || 0 })).filter(item => item.text);
+  const explicit = early.find(item => /^(?:(?:chapter|part|book|section)\s+(?:\d+|[ivxlcdm]+|[a-z])\b|prologue|epilogue|introduction|preface|foreword|afterword|conclusion|appendix\b|第.{1,12}[章节篇部]\b)/i.test(item.text)); if (explicit) return explicit.text;
+  const sizes = early.map(item => item.size).filter(Boolean).sort((a, b) => a - b), median = sizes.length ? sizes[Math.floor(sizes.length / 2)] : 0;
+  const sized = early.find(item => item.size && item.size >= Math.max(16, median * 1.25) && item.text.length <= 90 && !/[.!?。！？]$/.test(item.text)); return sized?.text || "";
+}
+function applyDetectedChapterTitle(chapter, doc) {
+  const detected = detectHtmlChapterTitle(doc); if (!chapter.title && detected) { chapter.title = detected; chapter.navLabel = detected; chapter.includeInToc = true; } return detected;
+}
+function automaticTocEntries(chapters) { return tableOfContentsEntries(finalizeAutomaticTocChapters(chapters)); }
+function updateBookTocPreview(book = state.book) {
+  const list = $("#book-toc-list"), statusLabel = $("#book-toc-status"); if (!list || !statusLabel) return; list.textContent = "";
+  if (!book?.chapters?.length || book.sourceType === "pdf") { statusLabel.textContent = "Generated during book export"; return; }
+  const entries = automaticTocEntries(book.chapters), named = entries.filter(entry => !isGenericNavigationLabel(entry.label)).length;
+  entries.slice(0, 12).forEach(entry => { const item = document.createElement("li"); item.textContent = entry.label; list.append(item); });
+  if (entries.length > 12) { const item = document.createElement("li"); item.className = "book-toc-more"; item.textContent = `+ ${entries.length - 12} more entries`; list.append(item); }
+  const analyzed = book.chapters.filter(chapter => chapter.loaded).length; statusLabel.textContent = `${entries.length} entries · ${named} named · ${analyzed}/${book.chapters.length} pages analyzed`;
+}
+function safeBookRenderDocument(html) {
+  const doc = new DOMParser().parseFromString(html || "", "text/html");
+  const styles = $$("style", doc).map(node => node.textContent || "").join("\n");
+  $$('style,link,base,script,iframe,object,embed', doc).forEach(node => node.remove());
+  $$('*', doc.body).forEach(node => { const style = node.style; if (!style) return; if (["fixed", "sticky"].includes(style.position)) { style.position = "static"; style.inset = "auto"; style.top = style.right = style.bottom = style.left = "auto"; } style.animation = "none"; style.transition = "none"; });
+  return { doc, styles };
+}
+let renderPageId = 0;
+function scopeBookStyles(styles, rootSelector) {
+  try {
+    const sheet = new CSSStyleSheet(); sheet.replaceSync(styles.replace(/position\s*:\s*(?:fixed|sticky)\b/gi, "position:static"));
+    const scopeSelector = selector => selector.split(",").map(part => { let value = part.trim().replace(/:root\b/g, rootSelector); if (value.includes(rootSelector)) return value; if (/^(?:html\b[^\s>+~]*)?\s*body\b/i.test(value)) return value.replace(/^(?:html\b[^\s>+~]*)?\s*body\b[^\s>+~]*/i, rootSelector); if (/^html\b/i.test(value)) return value.replace(/^html\b[^\s>+~]*/i, rootSelector); return `${rootSelector} ${value}`; }).join(",");
+    const serialize = rule => {
+      if (rule.selectorText) return rule.cssText.replace(rule.selectorText, scopeSelector(rule.selectorText));
+      if (rule.cssRules) { const open = rule.cssText.indexOf("{"); return open < 0 ? rule.cssText : `${rule.cssText.slice(0, open + 1)}${[...rule.cssRules].map(serialize).join("")}}`; }
+      return rule.cssText;
+    };
+    return [...sheet.cssRules].map(serialize).join("\n");
+  } catch { return ""; }
+}
+function mountIsolatedBookPage(host, className, styles = "") {
+  const page = document.createElement("div"), style = document.createElement("style"); page.id = `pf-isolated-render-${++renderPageId}`; page.className = className; const root = `#${page.id}`;
+  style.textContent = `${scopeBookStyles(styles, root)}\n${root},${root} *{box-sizing:border-box;animation:none!important;transition:none!important}${root}.print-page{width:794px!important;height:1123px!important;overflow:hidden!important;background:#fff;color:#171717;padding:72px 68px;font:17px/1.58 Georgia,"Times New Roman",serif}${root}.print-page img{max-width:100%;height:auto;max-height:930px;object-fit:contain}${root}.print-page h1,${root}.print-page h2,${root}.print-page h3{line-height:1.15}${root}.book-analysis-page{width:360px!important;height:480px!important;overflow:hidden!important;background:#fff;color:#171717;padding:28px 24px;font:15px/1.5 Georgia,"Times New Roman",serif}${root}.book-analysis-page img{max-width:100%;max-height:400px;object-fit:contain}`;
+  page.append(style); host.append(page); return { shell: page, page };
+}
 function configureBookMode(sourceType) {
   const fromPdf = sourceType === "pdf"; $("#book-step-label").textContent = fromPdf ? "PDF format conversion" : "Ebook format conversion";
   $("#book-action-title").textContent = fromPdf ? "Choose what to download." : "Review every ebook page, then download.";
@@ -444,13 +515,14 @@ $("#book-reset").addEventListener("click", () => {
   if ((state.book?.sourceType === "pdf" && state.pdf) || (state.pdfPending && state.bookFile === state.pdfFile)) { $("#pdf-reset").click(); return; }
   state.bookPageObserver?.disconnect(); state.book?.dispose?.(); state.book?.pdf?.destroy?.();
   state.bookFile = state.book = state.bookPending = null; state.bookPassword = "";
-  state.bookBlankness.clear(); state.bookFingerprints.clear(); state.bookReferencePage = null;
+  state.bookBlankness.clear(); state.bookAnalysisJobs.clear(); state.bookFingerprints.clear(); state.bookReferencePage = null; state.bookBlankScanId++;
   $("#book-summary").classList.remove("show");
   $("#book-page-queue").classList.remove("show"); $("#book-pages").textContent = "";
   $("#book-password-box").classList.remove("show"); $("#book-password").value = "";
   ["#book-convert", "#book-delete", "#book-analyze", "#book-auto-blank", "#book-find-similar", "#book-delete-unchecked"].forEach(id => $(id).disabled = true);
   $("#book-name").value = $("#book-author").value = "";
   $("#book-delete-range").value = ""; $("#book-reference-status").textContent = "Click a page preview to make it the blue reference.";
+  $("#book-toc-list").textContent = ""; $("#book-toc-status").textContent = "Waiting for a book";
   configureBookMode("ebook");
   resetWorkspaceDisplay();
 });
@@ -468,7 +540,7 @@ function updateBookConfirmation() {
   button.textContent = count ? `Confirm & prepare without ${count} marked page${count === 1 ? "" : "s"}` : "Confirm & prepare cleaned book";
 }
 function resetBookAnalysis() {
-  state.bookBlankness.clear(); state.bookFingerprints.clear(); state.bookReferencePage = null;
+  state.bookBlankness.clear(); state.bookAnalysisJobs.clear(); state.bookFingerprints.clear(); state.bookReferencePage = null; state.bookBlankScanId++;
   $("#book-reference-status").textContent = "Click a page preview to make it the blue reference."; $("#book-find-similar").disabled = true;
 }
 async function loadBookChapter(book, index) {
@@ -485,11 +557,12 @@ function renderBookPlaceholders() {
   state.bookPageObserver = new IntersectionObserver(entries => entries.filter(entry => entry.isIntersecting).forEach(entry => { state.bookPageObserver.unobserve(entry.target); renderBookThumb(entry.target); }), { rootMargin: "500px" });
   book.chapters.forEach((chapter, index) => {
     const pageNo = index + 1, label = chapterNavigationLabel(chapter, index), card = document.createElement("div"); card.className = "card"; card.dataset.page = pageNo;
-    card.innerHTML = `<button class="thumb pdf-reference-button" type="button" aria-pressed="false" title="Use ebook page ${pageNo} as the similarity reference"><span class="page-no">PAGE ${pageNo}</span></button><div class="card-meta"><span class="filename" title="${escapeHtml(label)}">${escapeHtml(label)}</span><span class="page-no">${escapeHtml(book.sourceType.toUpperCase())}</span></div><label class="page-keep"><input class="page-keep-check" type="checkbox" checked aria-label="Keep ebook page ${pageNo}"><span>Keep page</span></label><div class="blank-score">Not analyzed</div><div class="similarity-score">Similarity not analyzed</div>`;
+    card.innerHTML = `<button class="thumb pdf-reference-button" type="button" aria-pressed="false" title="Use ebook page ${pageNo} as the similarity reference"><span class="page-no">PAGE ${pageNo}</span></button><div class="card-meta"><span class="filename" title="${escapeHtml(label)}">${escapeHtml(label)}</span><span class="page-no">${escapeHtml(book.sourceType.toUpperCase())}</span></div><label class="page-keep"><input class="page-keep-check" type="checkbox" checked aria-label="Keep ebook page ${pageNo}"><span>Keep page</span></label><div class="blank-score">Calculating blank %…</div><div class="similarity-score">Similarity not analyzed</div>`;
     $(".pdf-reference-button", card).addEventListener("click", () => selectBookReference(pageNo));
     $(".page-keep-check", card).addEventListener("change", event => { clearBookPageMark(card); card.classList.toggle("page-removed", !event.target.checked); if (!event.target.checked) card.dataset.mark = "manual"; updateBookConfirmation(); });
     host.append(card); state.bookPageObserver.observe(card);
   });
+  updateBookTocPreview(book); void scheduleBookBlanknessScan(book);
 }
 async function renderBookThumb(card) {
   const book = state.book, pageNo = +card.dataset.page;
@@ -498,7 +571,7 @@ async function renderBookThumb(card) {
     const doc = new DOMParser().parseFromString(chapter.html || "", "text/html"), image = doc.body.querySelector("img[src]"), text = cleanChapterTitle(doc.body.textContent).slice(0, 260), thumb = $(".thumb", card);
     if (image?.getAttribute("src")) { const preview = document.createElement("img"); preview.alt = ""; preview.src = image.getAttribute("src"); thumb.replaceChildren(preview); }
     else { const preview = document.createElement("span"); preview.className = "book-text-preview"; preview.textContent = text || "Blank ebook page"; thumb.replaceChildren(preview); }
-    const label = chapterNavigationLabel(chapter, pageNo - 1), filename = $(".filename", card); filename.textContent = label; filename.title = label;
+    const label = chapterNavigationLabel(chapter, pageNo - 1), filename = $(".filename", card); filename.textContent = label; filename.title = label; updateBookTocPreview(book);
   } catch (error) { const thumb = $(".thumb", card); if (thumb) thumb.textContent = "Preview unavailable"; console.warn(error); }
 }
 function selectBookReference(pageNo) {
@@ -508,13 +581,23 @@ function selectBookReference(pageNo) {
 }
 async function getBookPageAnalysis(pageNo) {
   if (state.bookBlankness.has(pageNo) && state.bookFingerprints.has(pageNo)) return { blankness: state.bookBlankness.get(pageNo), fingerprint: state.bookFingerprints.get(pageNo) };
-  const chapter = await loadBookChapter(state.book, pageNo - 1), doc = new DOMParser().parseFromString(chapter.html || "", "text/html"), host = $("#render-host"), page = document.createElement("div");
-  page.className = "book-analysis-page"; $$('script,iframe,object,embed', doc).forEach(node => node.remove()); $$('style', doc).forEach(style => page.append(style.cloneNode(true))); [...doc.body.childNodes].forEach(node => page.append(node.cloneNode(true))); host.append(page); await waitForImages(page);
-  const canvas = await html2canvas(page, { backgroundColor: "#ffffff", scale: .5, logging: false, useCORS: false, imageTimeout: 0, width: 360, height: 480 }); page.remove();
-  const context = canvas.getContext("2d", { alpha: false }), pixels = context.getImageData(0, 0, canvas.width, canvas.height).data, blankness = calculateBlankPercentage(pixels), sample = document.createElement("canvas"); sample.width = sample.height = 48;
-  const sampleContext = sample.getContext("2d", { alpha: false }); sampleContext.fillStyle = "#fff"; sampleContext.fillRect(0, 0, 48, 48); sampleContext.drawImage(canvas, 0, 0, 48, 48); const samplePixels = sampleContext.getImageData(0, 0, 48, 48).data, fingerprint = new Uint8Array(48 * 48 * 3);
-  for (let source = 0, target = 0; source < samplePixels.length; source += 4) { fingerprint[target++] = samplePixels[source]; fingerprint[target++] = samplePixels[source + 1]; fingerprint[target++] = samplePixels[source + 2]; }
-  state.bookBlankness.set(pageNo, blankness); state.bookFingerprints.set(pageNo, fingerprint); const label = $(`.card[data-page="${pageNo}"] .blank-score`, $("#book-pages")); if (label) label.textContent = `${blankness.toFixed(1)}% blank`; return { blankness, fingerprint };
+  if (state.bookAnalysisJobs.has(pageNo)) return state.bookAnalysisJobs.get(pageNo);
+  const book = state.book, job = (async () => {
+    const chapter = await loadBookChapter(book, pageNo - 1), { doc, styles } = safeBookRenderDocument(chapter.html), mounted = mountIsolatedBookPage($("#render-host"), "book-analysis-page", styles), page = mounted.page;
+    [...doc.body.childNodes].forEach(node => page.append(node.cloneNode(true))); let canvas;
+    try { await waitForImages(page); canvas = await html2canvas(mounted.shell, { backgroundColor: "#ffffff", scale: .5, logging: false, useCORS: false, imageTimeout: 0, width: 360, height: 480 }); }
+    finally { mounted.shell.remove(); }
+    const context = canvas.getContext("2d", { alpha: false }), pixels = context.getImageData(0, 0, canvas.width, canvas.height).data, blankness = calculateBlankPercentage(pixels), sample = document.createElement("canvas"); sample.width = sample.height = 48;
+    const sampleContext = sample.getContext("2d", { alpha: false }); sampleContext.fillStyle = "#fff"; sampleContext.fillRect(0, 0, 48, 48); sampleContext.drawImage(canvas, 0, 0, 48, 48); const samplePixels = sampleContext.getImageData(0, 0, 48, 48).data, fingerprint = new Uint8Array(48 * 48 * 3);
+    for (let source = 0, target = 0; source < samplePixels.length; source += 4) { fingerprint[target++] = samplePixels[source]; fingerprint[target++] = samplePixels[source + 1]; fingerprint[target++] = samplePixels[source + 2]; }
+    if (state.book === book) { state.bookBlankness.set(pageNo, blankness); state.bookFingerprints.set(pageNo, fingerprint); const label = $(`.card[data-page="${pageNo}"] .blank-score`, $("#book-pages")); if (label) label.textContent = `${blankness.toFixed(1)}% blank`; updateBookTocPreview(book); }
+    return { blankness, fingerprint };
+  })().finally(() => state.bookAnalysisJobs.delete(pageNo));
+  state.bookAnalysisJobs.set(pageNo, job); return job;
+}
+async function scheduleBookBlanknessScan(book) {
+  if (!book?.chapters?.length) return; const scanId = ++state.bookBlankScanId; await idleTick(800);
+  for (let pageNo = 1; pageNo <= book.chapters.length; pageNo++) { if (scanId !== state.bookBlankScanId || state.book !== book) return; try { await getBookPageAnalysis(pageNo); } catch {} await idleTick(); }
 }
 async function analyzeBookBlankness() {
   const scores = [];
@@ -526,11 +609,15 @@ async function markBookBlankCandidates(threshold, exactBlank = false) {
   for (let pageNo = 1; pageNo <= scores.length; pageNo++) { const fingerprint = hasReference ? (await getBookPageAnalysis(pageNo)).fingerprint : null, similarity = hasReference ? pageNo === state.bookReferencePage ? 100 : calculateFingerprintSimilarity(reference, fingerprint) : 100, matched = hasReference ? pageNo !== state.bookReferencePage && matchesBlankAndSimilar(scores[pageNo - 1], threshold, similarity, similarityThreshold) : scores[pageNo - 1] >= threshold; if (hasReference) { const label = $(`.card[data-page="${pageNo}"] .similarity-score`, $("#book-pages")); if (label) label.textContent = pageNo === state.bookReferencePage ? "Blue reference · 100%" : `${similarity.toFixed(1)}% similar`; } if (!hasPersistentBookPageMark(pageNo)) setBookPageKept(pageNo, !matched, hasReference ? "combined" : "blank"); if (matched) count++; await tick(); }
   updateBookConfirmation(); status(`${count} ebook page${count === 1 ? "" : "s"} ${hasReference ? "matching both thresholds marked in purple" : `${exactBlank ? "fully blank" : `at least ${threshold}% blank`} marked in red`} · confirm before removal`, 100, true);
 }
-$("#book-delete").addEventListener("click", () => { try { const pages = parseRange($("#book-delete-range").value, state.book.chapters.length); if (!pages.length) throw new Error("Enter one or more ebook page numbers to mark."); pages.forEach(pageNo => setBookPageKept(pageNo, false, "range")); updateBookConfirmation(); status(`${pages.length} ebook page${pages.length === 1 ? "" : "s"} marked in green · confirm before removal`, 100, true); } catch (error) { fail(error); } });
+$("#book-delete").addEventListener("click", () => { try { const pages = parseRange($("#book-delete-range").value, state.book.chapters.length); if (!pages.length) throw new Error("Enter one or more ebook page numbers to mark."); pages.forEach(pageNo => setBookPageKept(pageNo, false, "range")); updateBookConfirmation(); status(`${pages.length} ebook page${pages.length === 1 ? "" : "s"} marked in orange · confirm before removal`, 100, true); } catch (error) { fail(error); } });
 $("#book-analyze").addEventListener("click", async () => { try { const threshold = +$("#book-blank-threshold").value; if (!Number.isFinite(threshold) || threshold < 0 || threshold > 100) throw new Error("Blank threshold must be between 0 and 100%."); await markBookBlankCandidates(threshold); } catch (error) { fail(error); } });
 $("#book-auto-blank").addEventListener("click", async () => { try { await markBookBlankCandidates(99.5, true); } catch (error) { fail(error); } });
 $("#book-find-similar").addEventListener("click", async () => { try { if (!state.bookReferencePage) throw new Error("Click an ebook page preview first to choose the blue reference."); const threshold = +$("#book-similarity-threshold").value; if (!Number.isFinite(threshold) || threshold < 0 || threshold > 100) throw new Error("Similarity threshold must be between 0 and 100%."); const reference = (await getBookPageAnalysis(state.bookReferencePage)).fingerprint; let count = 0; for (let pageNo = 1; pageNo <= state.book.chapters.length; pageNo++) { status(`Comparing ebook page ${pageNo} of ${state.book.chapters.length}`, 5 + pageNo / state.book.chapters.length * 90); const score = pageNo === state.bookReferencePage ? 100 : calculateFingerprintSimilarity(reference, (await getBookPageAnalysis(pageNo)).fingerprint), label = $(`.card[data-page="${pageNo}"] .similarity-score`, $("#book-pages")); if (label) label.textContent = pageNo === state.bookReferencePage ? "Blue reference · 100%" : `${score.toFixed(1)}% similar`; if (pageNo === state.bookReferencePage) setBookPageKept(pageNo, true); else if (score >= threshold) { if (!hasPersistentBookPageMark(pageNo)) setBookPageKept(pageNo, false, "similar"); count++; } else if (!hasPersistentBookPageMark(pageNo)) setBookPageKept(pageNo, true); await tick(); } updateBookConfirmation(); status(`${count} similar ebook page${count === 1 ? "" : "s"} marked in red · confirm before removal`, 100, true); } catch (error) { fail(error); } });
-$("#book-delete-unchecked").addEventListener("click", () => { try { const deleted = uncheckedBookPages(); if (!deleted.size) throw new Error("No ebook pages are marked for removal."); if (deleted.size === state.book.chapters.length) throw new Error("A book needs at least one page. Keep one or more pages."); const before = state.book.chapters.length; state.book.chapters = removeBookPages(state.book.chapters, deleted); state.book.cleaned = true; $("#book-delete-range").value = ""; state.bookBlankness.clear(); state.bookFingerprints.clear(); renderBookPlaceholders(); showBookDetails(state.book, state.bookFile); status(`${deleted.size} marked ebook page${deleted.size === 1 ? "" : "s"} removed · ${before - deleted.size} remain`, 100, true); } catch (error) { fail(error); } });
+function removeMarkedBookPages(deleted = uncheckedBookPages()) {
+  if (!deleted.size) throw new Error("No ebook pages are marked for removal."); if (deleted.size === state.book.chapters.length) throw new Error("A book needs at least one page. Keep one or more pages.");
+  const before = state.book.chapters.length; state.book.chapters = removeBookPages(state.book.chapters, deleted); state.book.cleaned = true; $("#book-delete-range").value = ""; state.bookBlankness.clear(); state.bookAnalysisJobs.clear(); state.bookFingerprints.clear(); state.bookBlankScanId++; renderBookPlaceholders(); showBookDetails(state.book, state.bookFile); status(`${deleted.size} marked ebook page${deleted.size === 1 ? "" : "s"} removed · ${before - deleted.size} remain`, 100, true); return deleted.size;
+}
+$("#book-delete-unchecked").addEventListener("click", () => { try { removeMarkedBookPages(); } catch (error) { fail(error); } });
 
 async function mapWithConcurrency(items, limit, worker) {
   const results = new Array(items.length); let next = 0;
@@ -600,7 +687,7 @@ async function parseEpub(file) {
   book.loadChapter = async (chapter, index) => {
     const assets = new Set();
     if (chapter.kind === "epub-image") { const data = await zipAssetData(zip, chapter.path, assets, assetCache); chapter.html = data ? `<div style="text-align:center"><img alt="Cover" src="${data}"></div>` : ""; }
-    else { const markup = await zip.file(chapter.path)?.async("text"); if (!markup) throw new Error(`EPUB page ${index + 1} is missing.`); const chapterDoc = new DOMParser().parseFromString(markup, "text/html"), detectedTitle = cleanChapterTitle(chapterDoc.querySelector("title")?.textContent) || cleanChapterTitle(chapterDoc.querySelector("h1,h2,h3")?.textContent); if (!chapter.title && detectedTitle) { chapter.title = detectedTitle; chapter.navLabel = detectedTitle; } chapter.html = await inlineEpubChapter(markup, chapter.path, zip, assets, assetCache); }
+    else { const markup = await zip.file(chapter.path)?.async("text"); if (!markup) throw new Error(`EPUB page ${index + 1} is missing.`); const chapterDoc = new DOMParser().parseFromString(markup, "text/html"); applyDetectedChapterTitle(chapter, chapterDoc); chapter.html = await inlineEpubChapter(markup, chapter.path, zip, assets, assetCache); }
     chapter.assets = [...assets]; return chapter;
   };
   return book;
@@ -616,7 +703,7 @@ async function parseMobi(file) {
   book.loadChapter = async (chapter, index) => {
     const assets = new Set();
     if (chapter.kind === "mobi-cover") { const data = await blobToDataURL(await (await realFetch(chapter.sourceUrl)).blob()); if (data.startsWith("data:image/")) assets.add(data); chapter.html = `<img alt="Cover" src="${data}">`; }
-    else { const loaded = mobi.loadChapter(chapter.mobiId); if (!loaded) throw new Error(`Ebook page ${index + 1} could not be read.`); const styles = await Promise.all((loaded.css || []).map(async css => { try { return `<style>${await (await realFetch(css.href)).text()}</style>`; } catch { return ""; } })); chapter.html = await inlineBlobImages(styles.join("") + loaded.html, assets); const chapterDoc = new DOMParser().parseFromString(chapter.html, "text/html"), detectedTitle = cleanChapterTitle(chapterDoc.querySelector("h1,h2,h3")?.textContent); if (!chapter.title && detectedTitle) { chapter.title = detectedTitle; chapter.navLabel = detectedTitle; } }
+    else { const loaded = mobi.loadChapter(chapter.mobiId); if (!loaded) throw new Error(`Ebook page ${index + 1} could not be read.`); const styles = await Promise.all((loaded.css || []).map(async css => { try { return `<style>${await (await realFetch(css.href)).text()}</style>`; } catch { return ""; } })); chapter.html = await inlineBlobImages(styles.join("") + loaded.html, assets); applyDetectedChapterTitle(chapter, new DOMParser().parseFromString(chapter.html, "text/html")); }
     chapter.assets = [...assets]; return chapter;
   };
   let destroyed = false; book.dispose = () => { if (!destroyed) { destroyed = true; mobi.destroy(); } }; return book;
@@ -637,7 +724,7 @@ async function materializeBook(book) {
       await zipAssetData(book.source.zip, path, assets, book.source.assetCache); await tick();
     });
   }
-  return { ...book, chapters: book.chapters.map(chapter => ({ ...chapter, html: chapter.html || "" })), assets: [...assets], lazy: false };
+  return { ...book, chapters: finalizeAutomaticTocChapters(book.chapters.map(chapter => ({ ...chapter, html: chapter.html || "" }))), assets: [...assets], lazy: false };
 }
 async function inlineBlobCss(css, assets) {
   const re = /url\(\s*(['"]?)(blob:[^)'"]+)\1\s*\)/gi; let out = "", at = 0, match;
@@ -706,7 +793,9 @@ async function downloadBookArtifact(book, output, title) {
 $("#book-convert").addEventListener("click", async () => {
   let generatedBook = null;
   try {
-    let book = state.book; if (!book) throw new Error("Choose a PDF or ebook first."); if (book.sourceType === "pdf" && !book.chapters.length) { generatedBook = await pdfAsBook(state.bookFile, true, book.password || state.bookPassword, book.bytes); book = generatedBook; }
+    if (!state.book) throw new Error("Choose a PDF or ebook first."); const marked = state.book.sourceType === "pdf" ? new Set() : uncheckedBookPages();
+    if (marked.size) { const choice = await askAboutMarkedPages("ebook", marked.size); if (choice === "cancel") { status("Download canceled", 100, true); return; } if (choice === "delete") removeMarkedBookPages(marked); }
+    stopBackgroundAnalysis(); let book = state.book; if (book.sourceType === "pdf" && !book.chapters.length) { generatedBook = await pdfAsBook(state.bookFile, true, book.password || state.bookPassword, book.bytes); book = generatedBook; }
     else if (book.lazy) book = await materializeBook(book);
     const title = safeName($("#book-name").value, book.title || "pageforge-book"), author = $("#book-author").value.trim(), mode = $("#book-filter").value, output = $("#book-output").value;
     const filtered = { ...filteredBook(book, mode), title, author };
@@ -715,7 +804,7 @@ $("#book-convert").addEventListener("click", async () => {
     if (mode === "text" && !filtered.chapters.some(ch => hasTextContent(ch.html))) throw new Error("No extractable text was found. This book may contain scanned page images only; choose Photos only instead.");
     await downloadBookArtifact(filtered, output, title);
     status(`${output.toUpperCase()} downloaded`, 100, true);
-  } catch (e) { fail(e); } finally { generatedBook?.pdf?.destroy?.(); }
+  } catch (e) { fail(e); } finally { generatedBook?.pdf?.destroy?.(); if (state.book?.sourceType !== "pdf") void scheduleBookBlanknessScan(state.book); }
 });
 async function downloadPdfPhotos(pdf, title, output, scale, compression, streamToFolder = false) {
   const ext = output === "jpeg" ? "jpg" : output;
@@ -746,12 +835,14 @@ $("#pdf-direct-format").addEventListener("change", updatePdfDirectPhotoOptions);
 $("#pdf-direct-download").addEventListener("click", async () => {
   let generatedBook = null;
   try {
-    if (!state.pdf) throw new Error("Choose a PDF first."); const output = $("#pdf-direct-format").value, title = safeName($("#pdf-direct-name").value, state.pdfFile.name.replace(/\.pdf$/i, "")), author = $("#pdf-direct-author").value.trim();
+    if (!state.pdf) throw new Error("Choose a PDF first."); const marked = uncheckedPdfPages();
+    if (marked.size) { const choice = await askAboutMarkedPages("PDF", marked.size); if (choice === "cancel") { status("Download canceled", 100, true); return; } if (choice === "delete") await preparePdfWithDeleted(marked); }
+    stopBackgroundAnalysis(); const output = $("#pdf-direct-format").value, title = safeName($("#pdf-direct-name").value, state.pdfFile.name.replace(/\.pdf$/i, "")), author = $("#pdf-direct-author").value.trim();
     if (output === "pdf") downloadBlob(author ? await pdfWithMetadata(state.pdfBytes, title, author, state.pdfPassword ? state.pdf : null) : bytesToBlob(state.pdfBytes, "application/pdf"), `${title}.pdf`);
     else if (["jpeg", "png", "webp"].includes(output)) { const scale = +$("#pdf-direct-photo-quality").value, compression = scale <= 1 ? .8 : scale <= 1.5 ? .88 : scale <= 2 ? .93 : .97; await downloadPdfPhotos(state.pdf, title, output, scale, compression, true); }
     else { generatedBook = await pdfAsBook(state.pdfFile, true, state.pdfPassword, state.pdfBytes); if (!generatedBook.chapters.length) throw new Error("No visible text or artwork remains to convert."); generatedBook.title = title; generatedBook.author = author; await downloadBookArtifact(generatedBook, output, title); }
     status(`${output.toUpperCase()} downloaded`, 100, true);
-  } catch (e) { if (e?.name === "AbortError") status("Save canceled", 100, true); else fail(e); } finally { generatedBook?.pdf?.destroy?.(); }
+  } catch (e) { if (e?.name === "AbortError") status("Save canceled", 100, true); else fail(e); } finally { generatedBook?.pdf?.destroy?.(); void schedulePdfBlanknessScan(state.pdf); }
 });
 function updatePdfResultPhotoOptions() {
   const isPhoto = ["jpeg", "png", "webp"].includes($("#pdf-result-format").value); $("#pdf-result-photo-options").classList.toggle("show", isPhoto);
@@ -776,18 +867,24 @@ $("#pdf-result-download").addEventListener("click", async () => {
 
 async function waitForImages(root) { await Promise.all($$("img", root).map(img => img.complete ? img.decode?.().catch(() => {}) : new Promise(resolve => { img.onload = img.onerror = resolve; }))); }
 async function makePrintPages(chapter) {
-  const host = $("#render-host"), doc = new DOMParser().parseFromString(chapter.html, "text/html"), styles = $$("style", doc).map(x => x.cloneNode(true)); $$('script,iframe,object,embed', doc).forEach(x => x.remove());
+  const host = $("#render-host"), { doc, styles } = safeBookRenderDocument(chapter.html);
   const sourceNodes = [...doc.body.childNodes].filter(n => n.nodeType !== 3 || n.textContent.trim()); const pages = [];
-  const newPage = () => { const p = document.createElement("div"); p.className = "print-page"; styles.forEach(s => p.append(s.cloneNode(true))); host.append(p); pages.push(p); return p; };
+  const newPage = () => { const mounted = mountIsolatedBookPage(host, "print-page", styles); mounted.page.pageforgeRenderShell = mounted.shell; pages.push(mounted.page); return mounted.page; };
   let page = newPage(), contentCount = 0;
   for (const original of sourceNodes) { const node = original.cloneNode(true); page.append(node); contentCount++; await waitForImages(node.nodeType === 1 ? node : page); if (page.scrollHeight > page.clientHeight && contentCount > 1) { node.remove(); page = newPage(); page.append(node); contentCount = 1; await waitForImages(page); } }
   return pages;
 }
 async function bookToPdf(book) {
-  const pdf = await PDFDocument.create(); pdf.setTitle(book.title || "PageForge book"); if (book.author) pdf.setAuthor(book.author); const total = book.chapters.length;
+  const pdf = await PDFDocument.create(); pdf.setTitle(book.title || "PageForge book"); if (book.author) pdf.setAuthor(book.author);
+  const visibleToc = book.filterMode === "images" ? "" : buildVisibleTableOfContents(book.chapters);
+  const chapters = visibleToc ? [{ title: "Contents", html: visibleToc, includeInToc: false }, ...book.chapters] : book.chapters;
+  const total = chapters.length;
   for (let i = 0; i < total; i++) {
-    status(`Typesetting section ${i + 1} of ${total}`, (i / total) * 88); const pages = await makePrintPages(book.chapters[i]); await tick();
-    for (const element of pages) { const canvas = await html2canvas(element, { backgroundColor: "#ffffff", scale: 1.35, logging: false, useCORS: false, imageTimeout: 0 }); const jpg = dataUrlToBytes(canvas.toDataURL("image/jpeg", .9)).bytes; const image = await pdf.embedJpg(jpg); const page = pdf.addPage([595.28, 841.89]); page.drawImage(image, { x: 0, y: 0, width: 595.28, height: 841.89 }); element.remove(); }
+    status(`Typesetting section ${i + 1} of ${total}`, (i / total) * 88); const pages = await makePrintPages(chapters[i]); await tick();
+    for (const element of pages) {
+      try { const canvas = await html2canvas(element.pageforgeRenderShell || element, { backgroundColor: "#ffffff", scale: 1.35, logging: false, useCORS: false, imageTimeout: 0 }); const jpg = dataUrlToBytes(canvas.toDataURL("image/jpeg", .9)).bytes; const image = await pdf.embedJpg(jpg); const page = pdf.addPage([595.28, 841.89]); page.drawImage(image, { x: 0, y: 0, width: 595.28, height: 841.89 }); }
+      finally { (element.pageforgeRenderShell || element).remove(); }
+    }
   }
   if (!pdf.getPageCount()) pdf.addPage([595.28, 841.89]); status("Finalizing PDF", 94); return bytesToBlob(await pdf.save({ useObjectStreams: true }), "application/pdf");
 }
