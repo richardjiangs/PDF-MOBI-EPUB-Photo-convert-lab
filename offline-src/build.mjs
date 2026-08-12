@@ -16,7 +16,8 @@ const result = await build({
   logLevel: "info",
 });
 
-const template = await readFile(resolve(root, "offline-src/template.html"), "utf8");
+const template = (await readFile(resolve(root, "offline-src/template.html"), "utf8"))
+  .replace(/\s*<div class="toc-proof"><strong>[\s\S]*?<\/p><\/div>/, "");
 const worker = await readFile(resolve(root, "node_modules/pdfjs-dist/build/pdf.worker.min.mjs"), "utf8");
 const bitcoinQr = (await readFile(resolve(root, "offline-src/assets/bitcoin-qr.png"))).toString("base64");
 const bundle = result.outputFiles[0].text.replaceAll("</script", "<\\/script");
