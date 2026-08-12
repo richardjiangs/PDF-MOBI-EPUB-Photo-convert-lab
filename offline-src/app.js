@@ -6,7 +6,7 @@ import { initMobiFile, initKf8File } from "@lingo-reader/mobi-parser";
 import { calculateBlankPercentage } from "./blankness.mjs";
 import { calculateFingerprintSimilarity, matchesBlankAndSimilar } from "./similarity.mjs";
 import { buildPdfFromKeptPages } from "./pdf-pages.mjs";
-import { buildNestedTocList, buildVisibleTableOfContents, chapterNavigationLabel, cleanChapterTitle, composeLegacyBookBody, createPdfBookChapter, finalizeAutomaticTocChapters, finalizePdfBookChapters, removeBookPages, tableOfContentsEntries, tableOfContentsTree, wrapKf8Chapter, wrapMobiChapter } from "./book-content.mjs";
+import { buildNestedTocList, buildVisibleTableOfContents, chapterNavigationLabel, cleanChapterTitle, composeLegacyBookBody, createPdfBookChapter, detectChapter, finalizeAutomaticTocChapters, finalizePdfBookChapters, removeBookPages, tableOfContentsEntries, tableOfContentsTree, wrapKf8Chapter, wrapMobiChapter } from "./book-content.mjs";
 
 const $ = (s, root = document) => root.querySelector(s);
 const $$ = (s, root = document) => [...root.querySelectorAll(s)];
@@ -454,19 +454,22 @@ $("#pdf-find-similar").addEventListener("click", async () => {
 $("#pdf-delete-unchecked").addEventListener("click", async () => { try { await preparePdfWithDeleted(uncheckedPdfPages()); } catch (e) { fail(e); } });
 
 // EPUB / MOBI / PDF conversion
-function detectHtmlChapterTitle(doc) {
-  const acceptable = value => { const text = cleanChapterTitle(value); return text.length >= 2 && text.length <= 140 && !/^(?:contents|table of contents)$/i.test(text) ? text : ""; };
-  const explicitPattern = /^(?:(?:chapter|part|book|section)\s+(?:\d+|[ivxlcdm]+|[a-z])\b|prologue|epilogue|introduction|preface|foreword|afterword|conclusion|appendix\b|第.{1,12}[章节篇部]\b)/i;
-  const selectors = ["[epub\\:type~='title']", "h1", "[role='heading'][aria-level='1']", ".chapter-title", ".chapter-heading", ".part-title", "[class*='chapter'][class*='title']", "[id*='chapter'][id*='title']"];
-  for (const selector of selectors) { let node; try { node = doc.querySelector(selector); } catch {} const title = acceptable(node?.textContent); if (title) return title; }
-  const titleElement = acceptable(doc.querySelector("title")?.textContent); if (titleElement && explicitPattern.test(titleElement)) return titleElement;
-  const early = $$('p,div,span', doc.body).slice(0, 18).map(node => ({ text: acceptable(node.textContent), size: parseFloat(node.style?.fontSize) || Number(node.getAttribute?.("size")) || 0 })).filter(item => item.text);
-  const explicit = early.find(item => explicitPattern.test(item.text)); if (explicit) return explicit.text;
-  const sizes = early.map(item => item.size).filter(Boolean).sort((a, b) => a - b), median = sizes.length ? sizes[Math.floor(sizes.length / 2)] : 0;
-  const sized = early.find(item => item.size && item.size >= Math.max(16, median * 1.25) && item.text.length <= 90 && !/[.!?。！？]$/.test(item.text)); return sized?.text || "";
+function detectHtmlChapter(doc) {
+  const acceptable = value => { const text = cleanChapterTitle(value); return text.length >= 2 && text.length <= 160 ? text : ""; };
+  const candidates = [], seen = new Set(), add = (node, forcedLevel = 0) => {
+    const text = acceptable(node?.textContent); if (!text || seen.has(text)) return; seen.add(text);
+    const tagLevel = /^H[1-3]$/.test(node.tagName) ? Number(node.tagName[1]) : 0, ariaLevel = node.getAttribute?.("role") === "heading" ? Number(node.getAttribute("aria-level")) || 0 : 0;
+    const className = String(node.className || ""), classLevel = /(?:part|book|volume)-?(?:title|heading)/i.test(className) ? 1 : /(?:section|scene)-?(?:title|heading)/i.test(className) ? 3 : /(?:chapter)-?(?:title|heading)/i.test(className) ? 2 : 0;
+    const weight = /bold/i.test(node.style?.fontWeight || "") ? 700 : parseFloat(node.style?.fontWeight) || 0;
+    candidates.push({ text, fontSize: parseFloat(node.style?.fontSize) || Number(node.getAttribute?.("size")) || 0, fontWeight: weight, headingLevel: forcedLevel || tagLevel || ariaLevel || classLevel });
+  };
+  for (const node of $$('h1,h2,h3,[role="heading"],[epub\\:type~="title"],.chapter-title,.chapter-heading,.part-title,.part-heading,.section-title,.section-heading,[class*="chapter"][class*="title"],[id*="chapter"][id*="title"]', doc.body).slice(0, 16)) add(node);
+  for (const node of $$('p,div,span', doc.body).filter(node => !node.querySelector('p,div,h1,h2,h3')).slice(0, 24)) add(node);
+  const titleElement = acceptable(doc.querySelector("title")?.textContent); if (titleElement) candidates.push({ text: titleElement, fontSize: 0, fontWeight: 0, headingLevel: 0 });
+  return detectChapter(candidates);
 }
 function applyDetectedChapterTitle(chapter, doc) {
-  const detected = detectHtmlChapterTitle(doc); if (!chapter.title && detected) { chapter.title = detected; chapter.navLabel = detected; chapter.includeInToc = false; chapter.tocSource = "detected"; chapter.tocLevel = 1; } return detected;
+  const detected = detectHtmlChapter(doc); if (!chapter.title && detected.title) { chapter.title = detected.title; chapter.navLabel = detected.title; chapter.includeInToc = false; chapter.tocSource = "detected"; chapter.tocLevel = detected.level; } return detected.title;
 }
 function automaticTocEntries(chapters) { return tableOfContentsEntries(finalizeAutomaticTocChapters(chapters)); }
 function updateBookTocPreview(book = state.book) {
@@ -1009,4 +1012,4 @@ function formatBytes(size) { if (size < 1024) return `${size} B`; if (size < 104
 
 window.addEventListener("offline", () => $("#network-proof").textContent = "Connection off · fully operational");
 if (!navigator.onLine) $("#network-proof").textContent = "Connection off · fully operational";
-window.__pageforgeTest = { parseRange, buildMobi, buildAzw3, buildEpub, filterHtml, version: "3.0" };
+window.__pageforgeTest = { parseRange, buildMobi, buildAzw3, buildEpub, filterHtml, version: "3.2" };
