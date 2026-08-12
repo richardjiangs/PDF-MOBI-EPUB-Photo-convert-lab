@@ -221,10 +221,15 @@ test("ships separate standalone and website editions", async () => {
   assert.match(output, /id="pdf-direct-author"/i);
   assert.match(output, /id="pdf-result-author"/i);
   assert.match(output, /recognize chapter headings offline/i);
-  assert.match(output, /Publisher navigation is preferred/i);
+  assert.match(output, /Smart 3\.2 analysis combines/i);
   assert.match(output, /Download as selected format/i);
   assert.match(output, /Mark range in orange/i);
-  assert.match(output, /Automatic offline table of contents: SMART 3\.2/i);
+  assert.match(output, /id="pdf-auto-toc"/i);
+  assert.match(output, /id="pdf-toc-list"/i);
+  assert.match(output, /id="pdf-toc-analyze"/i);
+  assert.match(output, /id="book-toc-analyze"/i);
+  assert.match(output, /Automatic table of contents/i);
+  assert.doesNotMatch(output, /Automatic offline table of contents: SMART 3\.2/i);
   assert.match(output, /id="book-toc"/i);
   assert.match(output, /id="book-chapter-level-1"/i);
   assert.match(output, /id="book-chapter-level-2"/i);
@@ -261,7 +266,7 @@ test("ships separate standalone and website editions", async () => {
   assert.match(source, /async function materializeBook/);
   assert.match(source, /function mapWithConcurrency/);
   assert.match(source, /Checking packaged EPUB artwork/);
-  assert.match(source, /complete page previews load locally/);
+  assert.match(source, /chapter analysis started automatically/);
   assert.match(source, /removeBookPages/);
   assert.match(source, /Incorrect password/);
   assert.match(source, /function buildAzw3/);
@@ -287,6 +292,9 @@ test("ships separate standalone and website editions", async () => {
   assert.match(source, /tableOfContentsTree/);
   assert.match(source, /function markBookChapter/);
   assert.match(source, /function markPdfChapter/);
+  assert.match(source, /function analyzePdfTableOfContents/);
+  assert.match(source, /function renderPdfTableOfContents/);
+  assert.match(source, /function analyzeBookTableOfContents/);
   assert.match(source, /function paintBookPreview/);
   assert.match(source, /finalizeAutomaticTocChapters/);
   assert.match(source, /function safeBookRenderDocument/);

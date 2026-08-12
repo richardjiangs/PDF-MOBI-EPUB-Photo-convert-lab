@@ -11,7 +11,17 @@ import { buildNestedTocList, buildVisibleTableOfContents, chapterNavigationLabel
 const $ = (s, root = document) => root.querySelector(s);
 const $$ = (s, root = document) => [...root.querySelectorAll(s)];
 const enc = new TextEncoder();
-const state = { photos: [], pdfFile: null, pdfBytes: null, pdf: null, pdfPending: null, pdfPassword: "", pdfBlankness: new Map(), pdfBlanknessJobs: new Map(), pdfFingerprints: new Map(), pdfReferencePage: null, pdfResult: null, pdfBlankScanId: 0, pdfChapterMarkLevel: 0, pdfChapterMarks: new Map(), bookFile: null, book: null, bookPending: null, bookPassword: "", bookBlankness: new Map(), bookAnalysisJobs: new Map(), bookFingerprints: new Map(), bookReferencePage: null, bookPageObserver: null, bookBlankScanId: 0, bookChapterMarkLevel: 0 };
+const state = { photos: [], pdfFile: null, pdfBytes: null, pdf: null, pdfPending: null, pdfPassword: "", pdfBlankness: new Map(), pdfBlanknessJobs: new Map(), pdfFingerprints: new Map(), pdfReferencePage: null, pdfResult: null, pdfBlankScanId: 0, pdfChapterScanId: 0, pdfChapterScanJob: null, pdfAutoChapters: [], pdfChapterMarkLevel: 0, pdfChapterMarks: new Map(), bookFile: null, book: null, bookPending: null, bookPassword: "", bookBlankness: new Map(), bookAnalysisJobs: new Map(), bookFingerprints: new Map(), bookReferencePage: null, bookPageObserver: null, bookBlankScanId: 0, bookChapterMarkLevel: 0 };
+function installTableOfContentsInterface() {
+  const pageCards = document.getElementById("pdf-pages"), queue = document.getElementById("pdf-queue");
+  document.querySelector(".toc-proof")?.remove();
+  const panel = document.getElementById("pdf-auto-toc");
+  queue?.insertBefore(panel, pageCards);
+  const bookHeading = document.querySelector("#book-toc .book-toc-head strong"); if (bookHeading) bookHeading.textContent = "Automatic table of contents · manual override";
+  const bookToc = document.getElementById("book-toc"), chapterTools = bookToc?.querySelector(".chapter-mark-tools"), bookButton = document.getElementById("book-toc-analyze"); bookToc?.insertBefore(bookButton, chapterTools);
+  document.getElementById("toc-interface-source")?.remove();
+}
+installTableOfContentsInterface();
 const workerSource = $("#pdf-worker-source").textContent;
 pdfjsLib.GlobalWorkerOptions.workerSrc = URL.createObjectURL(new Blob([workerSource], { type: "text/javascript" }));
 
@@ -244,14 +254,14 @@ async function loadPdf(file, password = "", existingBytes = null) {
     showWorkspaceMode("pdf");
     status(password ? "Unlocking PDF locally" : "Reading PDF locally", 8); const bytes = existingBytes || new Uint8Array(await file.arrayBuffer());
     const task = pdfjsLib.getDocument({ data: bytes.slice(), password: password || undefined }); const pdf = await task.promise, pdfMetadata = await pdf.getMetadata().catch(() => ({})), detectedAuthor = cleanChapterTitle(pdfMetadata?.info?.Author);
-    state.pdfFile = file; state.pdfBytes = bytes; state.pdf = pdf; state.pdfPending = null; state.pdfPassword = password; state.pdfBlankness.clear(); state.pdfBlanknessJobs.clear(); state.pdfFingerprints.clear(); state.pdfReferencePage = null; state.pdfResult = null; state.pdfBlankScanId++; state.pdfChapterMarks.clear(); state.pdfChapterMarkLevel = 0; setChapterMarkMode("pdf", 0);
+    state.pdfFile = file; state.pdfBytes = bytes; state.pdf = pdf; state.pdfPending = null; state.pdfPassword = password; state.pdfBlankness.clear(); state.pdfBlanknessJobs.clear(); state.pdfFingerprints.clear(); state.pdfReferencePage = null; state.pdfResult = null; state.pdfBlankScanId++; state.pdfChapterScanId++; state.pdfChapterScanJob = null; state.pdfAutoChapters = []; state.pdfChapterMarks.clear(); state.pdfChapterMarkLevel = 0; setChapterMarkMode("pdf", 0);
     invalidatePdfResult(); $("#pdf-reference-status").textContent = "Click a page preview to make it the blue reference."; $("#pdf-find-similar").disabled = true;
     $("#pdf-direct-name").value = safeName(file.name.replace(/\.pdf$/i, "")); $("#pdf-direct-author").value = detectedAuthor; $("#pdf-result-author").value = "";
     $("#pdf-password-box").classList.remove("show"); $("#pdf-password").value = "";
     $("#pdf-queue").classList.add("show"); $("#pdf-count").textContent = `${pdf.numPages} pages · ${formatBytes(file.size)}`;
     ["#pdf-direct-download", "#pdf-delete", "#pdf-analyze", "#pdf-auto-blank"].forEach(id => $(id).disabled = false); $("#pdf-delete-unchecked").disabled = true;
     stagePdfForBook(file, pdf, bytes, password, detectedAuthor);
-    renderPdfPlaceholders(); status("PDF ready · every page is kept until you untick it", 100, true);
+    renderPdfPlaceholders(); void analyzePdfTableOfContents(); status("PDF ready · chapter analysis started automatically", 100, true);
   } catch (e) {
     if (isPasswordError(e)) {
       const bytes = existingBytes || new Uint8Array(await file.arrayBuffer()); state.pdfPending = { file, bytes }; state.pdfFile = file;
@@ -268,13 +278,14 @@ $("#pdf-reset").addEventListener("click", () => {
   const resetBookToo = state.book?.sourceType === "pdf" || state.bookFile === state.pdfFile;
   thumbObserver?.disconnect();
   state.pdf?.destroy?.();
-  state.pdfFile = state.pdfBytes = state.pdf = state.pdfPending = null; state.pdfPassword = ""; state.pdfBlankness.clear(); state.pdfBlanknessJobs.clear(); state.pdfFingerprints.clear(); state.pdfReferencePage = null; state.pdfResult = null; state.pdfBlankScanId++; state.pdfChapterMarks.clear(); state.pdfChapterMarkLevel = 0; setChapterMarkMode("pdf", 0);
+  state.pdfFile = state.pdfBytes = state.pdf = state.pdfPending = null; state.pdfPassword = ""; state.pdfBlankness.clear(); state.pdfBlanknessJobs.clear(); state.pdfFingerprints.clear(); state.pdfReferencePage = null; state.pdfResult = null; state.pdfBlankScanId++; state.pdfChapterScanId++; state.pdfChapterScanJob = null; state.pdfAutoChapters = []; state.pdfChapterMarks.clear(); state.pdfChapterMarkLevel = 0; setChapterMarkMode("pdf", 0);
   $("#pdf-pages").textContent = "";
   $("#pdf-queue").classList.remove("show");
   $("#pdf-password-box").classList.remove("show"); $("#pdf-password").value = "";
   $("#pdf-direct-author").value = $("#pdf-result-author").value = "";
   ["#pdf-direct-download", "#pdf-delete", "#pdf-analyze", "#pdf-auto-blank", "#pdf-find-similar", "#pdf-delete-unchecked", "#pdf-result-download"].forEach(id => $(id).disabled = true);
   $("#pdf-reference-status").textContent = "Click a page preview to make it the blue reference."; invalidatePdfResult();
+  renderPdfTableOfContents(); $("#pdf-toc-analyze").disabled = true;
   if (resetBookToo) { state.bookFile = state.book = state.bookPending = null; $("#book-summary").classList.remove("show"); $("#book-convert").disabled = true; }
   resetWorkspaceDisplay();
 });
@@ -283,11 +294,39 @@ function updatePdfChapterSummary() {
   const count = state.pdfChapterMarks.size, active = state.pdfChapterMarkLevel, label = $("#pdf-chapter-mark-status");
   label.textContent = `${active ? `${chapterLevelName(active)} marking is on` : "Chapter marking is off"} · ${count} manual chapter${count === 1 ? "" : "s"}.`;
 }
+function renderTocTree(list, entries, clickPage = null) {
+  list.textContent = "";
+  const tree = tableOfContentsTree(entries), append = (parent, nodes) => { for (const node of nodes) { const item = document.createElement("li"), label = document.createElement(node.children.length ? "details" : "span");
+    if (node.children.length) { const summary = document.createElement("summary"), nested = document.createElement("ol"); summary.textContent = node.label; if (clickPage) { summary.dataset.pageLink = String(node.index + 1); summary.addEventListener("click", event => { if (event.target === summary) clickPage(node.index + 1); }); } label.append(summary); append(nested, node.children); label.append(nested); }
+    else { label.className = "toc-leaf"; label.textContent = node.label; if (clickPage) { label.dataset.pageLink = String(node.index + 1); label.addEventListener("click", () => clickPage(node.index + 1)); } }
+    item.append(label); parent.append(item); } }; append(list, tree);
+}
+function pdfTocEntries() {
+  if (state.pdfChapterMarks.size) return [...state.pdfChapterMarks.entries()].sort((a, b) => a[0] - b[0]).map(([pageNo, mark]) => ({ index: pageNo - 1, id: `pf-chapter-${pageNo}`, label: mark.title || `Page ${pageNo}`, level: mark.level || 1 }));
+  return state.pdfAutoChapters.map(chapter => ({ index: chapter.pageNo - 1, id: `pf-chapter-${chapter.pageNo}`, label: chapter.title, level: chapter.level || 1 }));
+}
+function renderPdfTableOfContents(message = "") {
+  const list = $("#pdf-toc-list"), label = $("#pdf-toc-status"), entries = pdfTocEntries(); if (!list || !label) return;
+  if (entries.length) renderTocTree(list, entries, pageNo => $(`.card[data-page="${pageNo}"]`, $("#pdf-pages"))?.scrollIntoView({ behavior: "smooth", block: "center" }));
+  else { list.innerHTML = `<li class="toc-empty">${escapeHtml(state.pdf ? "No reliable chapters detected yet. Use manual marks if needed." : "Detected chapters will appear here.")}</li>`; }
+  label.textContent = message || (state.pdfChapterMarks.size ? `MANUAL · ${entries.length} entries` : state.pdf ? `AUTO · ${entries.length} entries` : "Waiting for a PDF");
+}
+async function analyzePdfTableOfContents(force = false) {
+  const pdf = state.pdf; if (!pdf) return; if (state.pdfChapterScanJob && !force) return state.pdfChapterScanJob;
+  const scanId = ++state.pdfChapterScanId; $("#pdf-toc-analyze").disabled = true; renderPdfTableOfContents(`ANALYZING · 0/${pdf.numPages}`);
+  const job = (async () => { const found = [];
+    for (let pageNo = 1; pageNo <= pdf.numPages; pageNo++) { if (state.pdf !== pdf || scanId !== state.pdfChapterScanId) return; const page = await pdf.getPage(pageNo), content = await page.getTextContent(), lines = []; let line = [], fontSize = 0;
+      for (const item of content.items || []) { const value = String(item.str || "").trim(), size = Math.abs(Number(item.transform?.[3]) || Number(item.height) || 0); if (value) { line.push(value); fontSize = Math.max(fontSize, size); } if (item.hasEOL && line.length) { lines.push({ text: line.join(" "), fontSize }); line = []; fontSize = 0; } } if (line.length) lines.push({ text: line.join(" "), fontSize }); page.cleanup();
+      const detected = detectChapter(lines); if (detected.title) found.push({ pageNo, title: detected.title, level: detected.level, confidence: detected.confidence }); renderPdfTableOfContents(`ANALYZING · ${pageNo}/${pdf.numPages}`); await idleTick(80); }
+    if (state.pdf !== pdf || scanId !== state.pdfChapterScanId) return; const finalized = finalizePdfBookChapters(found.map(item => ({ ...item, navLabel: item.title }))); state.pdfAutoChapters = finalized.filter(item => item.includeInToc); renderPdfTableOfContents();
+  })().catch(error => { if (state.pdf === pdf) { console.warn(error); renderPdfTableOfContents("Analysis could not finish"); } }).finally(() => { if (state.pdf === pdf && scanId === state.pdfChapterScanId) { state.pdfChapterScanJob = null; $("#pdf-toc-analyze").disabled = false; } }); state.pdfChapterScanJob = job; return job;
+}
+$("#pdf-toc-analyze").addEventListener("click", () => { state.pdfAutoChapters = []; void analyzePdfTableOfContents(true); });
 function markPdfChapter(pageNo) {
   const level = state.pdfChapterMarkLevel; if (!level) return selectPdfReference(pageNo);
   const card = $(`.card[data-page="${pageNo}"]`, $("#pdf-pages")), current = state.pdfChapterMarks.get(pageNo), input = card && $(".chapter-title-input", card);
   if (current?.level === level) state.pdfChapterMarks.delete(pageNo); else state.pdfChapterMarks.set(pageNo, { level, title: cleanChapterTitle(input?.value) || `Page ${pageNo}` });
-  const mark = state.pdfChapterMarks.get(pageNo); syncChapterCard(card, mark?.level || 0, mark?.title || `Page ${pageNo}`); updatePdfChapterSummary(); invalidatePdfResult();
+  const mark = state.pdfChapterMarks.get(pageNo); syncChapterCard(card, mark?.level || 0, mark?.title || `Page ${pageNo}`); updatePdfChapterSummary(); renderPdfTableOfContents(); invalidatePdfResult();
 }
 function renderPdfPlaceholders() {
   const host = $("#pdf-pages"); host.textContent = ""; thumbObserver?.disconnect();
@@ -298,11 +337,12 @@ function renderPdfPlaceholders() {
     card.innerHTML = `<button class="thumb pdf-reference-button" type="button" aria-pressed="false" title="Use page ${n} for the active chapter or similarity tool"><span class="page-no">PAGE ${n}</span></button><div class="card-meta"><span class="filename">Page ${n}</span><span class="page-no">PDF</span></div><div class="chapter-editor"><span class="chapter-badge">Not in manual contents</span><input class="chapter-title-input" maxlength="140" value="${escapeHtml(chapterMark?.title || `Page ${n}`)}" aria-label="Chapter title for PDF page ${n}"></div><label class="page-keep"><input class="page-keep-check" type="checkbox" checked aria-label="Keep page ${n}"><span>Keep page</span></label><div class="blank-score">Calculating blank %…</div><div class="similarity-score">Similarity not analyzed</div>`;
     syncChapterCard(card, chapterMark?.level || 0, chapterMark?.title || `Page ${n}`);
     $(".pdf-reference-button", card).addEventListener("click", () => markPdfChapter(n));
-    $(".chapter-title-input", card).addEventListener("input", event => { const mark = state.pdfChapterMarks.get(n); if (mark) { mark.title = cleanChapterTitle(event.target.value) || `Page ${n}`; updatePdfChapterSummary(); invalidatePdfResult(); } });
+    $(".chapter-title-input", card).addEventListener("input", event => { const mark = state.pdfChapterMarks.get(n); if (mark) { mark.title = cleanChapterTitle(event.target.value) || `Page ${n}`; updatePdfChapterSummary(); renderPdfTableOfContents(); invalidatePdfResult(); } });
     $(".page-keep-check", card).addEventListener("change", e => { clearPageMark(card); card.classList.toggle("page-removed", !e.target.checked); if (!e.target.checked) card.dataset.mark = "manual"; invalidatePdfResult(); updatePdfConfirmation(); });
     host.append(card); thumbObserver.observe(card);
   }
   updatePdfChapterSummary();
+  renderPdfTableOfContents();
   void schedulePdfBlanknessScan(state.pdf);
 }
 async function renderPdfThumb(card) {
@@ -396,12 +436,12 @@ async function preparePdfWithDeleted(deleted) {
   const cleanedFile = new File([cleanedBytes], `${cleanedName}.pdf`, { type: "application/pdf", lastModified: Date.now() });
 
   state.pdfFile = cleanedFile; state.pdfBytes = cleanedBytes; state.pdf = cleanedPdf; state.pdfPending = null; state.pdfPassword = "";
-  state.pdfBlankness.clear(); state.pdfBlanknessJobs.clear(); state.pdfFingerprints.clear(); state.pdfReferencePage = null; state.pdfBlankScanId++; state.pdfChapterMarks = remappedChapterMarks;
+  state.pdfBlankness.clear(); state.pdfBlanknessJobs.clear(); state.pdfFingerprints.clear(); state.pdfReferencePage = null; state.pdfBlankScanId++; state.pdfChapterScanId++; state.pdfChapterScanJob = null; state.pdfAutoChapters = []; state.pdfChapterMarks = remappedChapterMarks;
   state.pdfResult = { bytes: cleanedBytes, keep, deleted: new Set(deleted), flattened, stem };
   $("#pdf-reference-status").textContent = "Click a page preview to make it the blue reference."; $("#pdf-find-similar").disabled = true;
   $("#pdf-delete-range").value = ""; $("#pdf-direct-name").value = cleanedName;
   $("#pdf-count").textContent = `${cleanedPdf.numPages} pages · ${formatBytes(cleanedFile.size)}`;
-  renderPdfPlaceholders(); updatePdfConfirmation(); stagePdfForBook(cleanedFile, cleanedPdf, cleanedBytes, "", $("#pdf-direct-author").value.trim());
+  renderPdfPlaceholders(); updatePdfConfirmation(); stagePdfForBook(cleanedFile, cleanedPdf, cleanedBytes, "", $("#pdf-direct-author").value.trim()); void analyzePdfTableOfContents();
   await originalPdf.destroy?.();
 
   $("#pdf-result-name").value = cleanedName; $("#pdf-result-author").value = $("#pdf-direct-author").value; $("#pdf-result-summary").textContent = `${cleanedPdf.numPages} page${cleanedPdf.numPages === 1 ? "" : "s"} remain · ${deleted.size} removed${flattened ? " · protected PDF flattened" : ""}`;
@@ -478,6 +518,11 @@ function updateBookTocPreview(book = state.book) {
   const entries = automaticTocEntries(book.chapters), tree = tableOfContentsTree(entries), manual = book.chapters.some(chapter => Number(chapter.manualTocLevel) >= 1), append = (parent, nodes) => { for (const node of nodes) { const item = document.createElement("li"); if (node.children.length) { const details = document.createElement("details"), summary = document.createElement("summary"), children = document.createElement("ol"); summary.textContent = node.label; details.append(summary); append(children, node.children); details.append(children); item.append(details); } else { item.className = "toc-leaf"; item.textContent = node.label; } parent.append(item); } }; append(list, tree);
   const analyzed = book.chapters.filter(chapter => chapter.loaded).length; statusLabel.textContent = `${manual ? "MANUAL" : "AUTO"} · ${entries.length} entries · ${analyzed}/${book.chapters.length} pages analyzed`;
 }
+async function analyzeBookTableOfContents(force = false) {
+  const book = state.book; if (!book?.chapters?.length || book.sourceType === "pdf") return;
+  if (force) for (const chapter of book.chapters) if (chapter.tocSource !== "publisher" && !chapter.manualTocLevel) { chapter.loaded = false; chapter.loading = null; chapter.title = ""; chapter.navLabel = `Section ${book.chapters.indexOf(chapter) + 1}`; chapter.tocSource = "unknown"; }
+  $("#book-toc-analyze").disabled = true; try { for (let index = 0; index < book.chapters.length; index++) { if (state.book !== book) return; await loadBookChapter(book, index); updateBookTocPreview(book); await idleTick(80); } book.chapters = finalizeAutomaticTocChapters(book.chapters); updateBookTocPreview(book); } finally { if (state.book === book) $("#book-toc-analyze").disabled = false; }
+}
 function markBookChapter(pageNo) {
   const level = state.bookChapterMarkLevel; if (!level) return selectBookReference(pageNo);
   const chapter = state.book?.chapters?.[pageNo - 1], card = $(`.card[data-page="${pageNo}"]`, $("#book-pages")); if (!chapter || !card) return;
@@ -536,7 +581,7 @@ async function loadBook(file, password = "") {
     if (type === "epub") book = await parseEpub(file);
     else if (type === "pdf") book = await pdfAsBook(file, false, password);
     else book = await parseMobi(file);
-    state.book = book; state.bookPending = null; state.bookPassword = password; state.bookChapterMarkLevel = 0; setChapterMarkMode("book", 0); $("#book-password-box").classList.remove("show"); $("#book-password").value = ""; showBookDetails(book, file); if (book.sourceType !== "pdf") renderBookPlaceholders(); status("Book ready · complete page previews load locally", 100, true);
+    state.book = book; state.bookPending = null; state.bookPassword = password; state.bookChapterMarkLevel = 0; setChapterMarkMode("book", 0); $("#book-password-box").classList.remove("show"); $("#book-password").value = ""; showBookDetails(book, file); if (book.sourceType !== "pdf") { renderBookPlaceholders(); $("#book-toc-analyze").disabled = false; void analyzeBookTableOfContents(); } status("Book ready · chapter analysis started automatically", 100, true);
   } catch (e) {
     if (file.name.toLowerCase().endsWith(".pdf") && isPasswordError(e)) {
       state.book = null; state.bookPending = { file }; state.bookFile = file;
@@ -561,6 +606,7 @@ $("#book-reset").addEventListener("click", () => {
   $("#book-name").value = $("#book-author").value = "";
   $("#book-delete-range").value = ""; $("#book-reference-status").textContent = "Click a page preview to make it the blue reference.";
   $("#book-toc-list").textContent = ""; $("#book-toc-status").textContent = "Waiting for a book";
+  $("#book-toc-analyze").disabled = true;
   configureBookMode("ebook");
   resetWorkspaceDisplay();
 });
@@ -604,6 +650,7 @@ function renderBookPlaceholders() {
   });
   updateBookTocPreview(book); void scheduleBookBlanknessScan(book);
 }
+$("#book-toc-analyze").addEventListener("click", () => { void analyzeBookTableOfContents(true); });
 async function renderBookThumb(card) {
   const book = state.book, pageNo = +card.dataset.page;
   try {
