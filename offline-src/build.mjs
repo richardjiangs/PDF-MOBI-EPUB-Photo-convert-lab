@@ -17,10 +17,12 @@ const result = await build({
 });
 
 const template = (await readFile(resolve(root, "offline-src/template.html"), "utf8"))
-  .replace(/\s*<div class="toc-proof"><strong>[\s\S]*?<\/p><\/div>/, "");
+  .replace(/\s*<div class="toc-proof"><strong>[\s\S]*?<\/p><\/div>/, "")
+  .replaceAll("Smart 3.2 analysis", "Automatic chapters 2.0")
+  .replaceAll("SMART 3.2", "automatic chapters 2.0");
 const worker = await readFile(resolve(root, "node_modules/pdfjs-dist/build/pdf.worker.min.mjs"), "utf8");
 const bitcoinQr = (await readFile(resolve(root, "offline-src/assets/bitcoin-qr.png"))).toString("base64");
-const bundle = result.outputFiles[0].text.replaceAll("</script", "<\\/script");
+const bundle = result.outputFiles[0].text.replaceAll("</script", "<\\/script").replace(/[ \t]+$/gm, "");
 const html = template
   .replace("/*__PDF_WORKER__*/", () => worker)
   .replace("/*__APP_BUNDLE__*/", () => bundle)
@@ -32,7 +34,7 @@ await mkdir(resolve(root, "public"), { recursive: true });
 await mkdir(resolve(root, "docs"), { recursive: true });
 await mkdir(resolve(root, "work"), { recursive: true });
 await writeFile(resolve(root, "outputs/PageForge.html"), standaloneHtml);
-await writeFile(resolve(root, "outputs/PageForge-Local 3.2.html"), standaloneHtml);
+await writeFile(resolve(root, "outputs/PageForge-Local 3.5.html"), standaloneHtml);
 await writeFile(resolve(root, "public/PageForge.html"), standaloneHtml);
 await writeFile(resolve(root, "index.html"), websiteHtml);
 await writeFile(resolve(root, "public/index.html"), websiteHtml);
@@ -44,4 +46,4 @@ await copyFile(resolve(root, "public/og.png"), resolve(root, "docs/og.png"));
 await copyFile(resolve(root, "public/og-3.2.png"), resolve(root, "docs/og-3.2.png"));
 await copyFile(resolve(root, "public/favicon.png"), resolve(root, "docs/favicon.png"));
 await writeFile(resolve(root, "work/pageforge.bundle.js"), bundle);
-console.log(`Built PageForge-Local 3.2.html (${(standaloneHtml.length / 1048576).toFixed(2)} MB), website, and GitHub Pages edition`);
+console.log(`Built PageForge-Local 3.5.html (${(standaloneHtml.length / 1048576).toFixed(2)} MB), website, and GitHub Pages edition`);

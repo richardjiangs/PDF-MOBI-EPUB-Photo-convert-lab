@@ -6,19 +6,19 @@ import { initMobiFile, initKf8File } from "@lingo-reader/mobi-parser";
 import { calculateBlankPercentage } from "./blankness.mjs";
 import { calculateFingerprintSimilarity, matchesBlankAndSimilar } from "./similarity.mjs";
 import { buildPdfFromKeptPages } from "./pdf-pages.mjs";
-import { buildNestedTocList, buildVisibleTableOfContents, chapterNavigationLabel, cleanChapterTitle, composeLegacyBookBody, createPdfBookChapter, detectChapter, finalizeAutomaticTocChapters, finalizePdfBookChapters, removeBookPages, tableOfContentsEntries, tableOfContentsTree, wrapKf8Chapter, wrapMobiChapter } from "./book-content.mjs";
+import { analyzeChapterPages, buildNestedTocList, buildVisibleTableOfContents, chapterNavigationLabel, cleanChapterTitle, createPdfBookChapter, detectChapter, extractPdfTextLines, finalizeAutomaticTocChapters, finalizePdfBookChapters, removeBookPages, tableOfContentsEntries, tableOfContentsTree, wrapKf8Chapter, wrapMobiChapter } from "./book-content.mjs";
 
 const $ = (s, root = document) => root.querySelector(s);
 const $$ = (s, root = document) => [...root.querySelectorAll(s)];
 const enc = new TextEncoder();
-const state = { photos: [], pdfFile: null, pdfBytes: null, pdf: null, pdfPending: null, pdfPassword: "", pdfBlankness: new Map(), pdfBlanknessJobs: new Map(), pdfFingerprints: new Map(), pdfReferencePage: null, pdfResult: null, pdfBlankScanId: 0, pdfChapterScanId: 0, pdfChapterScanJob: null, pdfAutoChapters: [], pdfChapterMarkLevel: 0, pdfChapterMarks: new Map(), bookFile: null, book: null, bookPending: null, bookPassword: "", bookBlankness: new Map(), bookAnalysisJobs: new Map(), bookFingerprints: new Map(), bookReferencePage: null, bookPageObserver: null, bookBlankScanId: 0, bookChapterMarkLevel: 0 };
+const state = { photos: [], pdfFile: null, pdfBytes: null, pdf: null, pdfPending: null, pdfPassword: "", pdfBlankness: new Map(), pdfBlanknessJobs: new Map(), pdfFingerprints: new Map(), pdfReferencePage: null, pdfResult: null, pdfBlankScanId: 0, pdfChapterScanId: 0, pdfChapterScanJob: null, pdfAutoChapters: [], pdfAutoChaptersEnabled: true, pdfChapterMarkLevel: 0, pdfChapterMarks: new Map(), bookFile: null, book: null, bookPending: null, bookPassword: "", bookBlankness: new Map(), bookAnalysisJobs: new Map(), bookFingerprints: new Map(), bookReferencePage: null, bookPageObserver: null, bookBlankScanId: 0, bookChapterScanId: 0, bookChapterScanJob: null, bookAutoChaptersEnabled: true, bookChapterMarkLevel: 0 };
 function installTableOfContentsInterface() {
   const pageCards = document.getElementById("pdf-pages"), queue = document.getElementById("pdf-queue");
   document.querySelector(".toc-proof")?.remove();
   const panel = document.getElementById("pdf-auto-toc");
   queue?.insertBefore(panel, pageCards);
-  const bookHeading = document.querySelector("#book-toc .book-toc-head strong"); if (bookHeading) bookHeading.textContent = "Automatic table of contents · manual override";
-  const bookToc = document.getElementById("book-toc"), chapterTools = bookToc?.querySelector(".chapter-mark-tools"), bookButton = document.getElementById("book-toc-analyze"); bookToc?.insertBefore(bookButton, chapterTools);
+  const bookHeading = document.querySelector("#book-toc .book-toc-head strong"); if (bookHeading) bookHeading.textContent = "Automatic chapters 2.0 · every ebook format";
+  const bookToc = document.getElementById("book-toc"), chapterTools = bookToc?.querySelector(".chapter-mark-tools"), bookActions = document.getElementById("book-toc-actions"); bookToc?.insertBefore(bookActions, chapterTools);
   document.getElementById("toc-interface-source")?.remove();
 }
 installTableOfContentsInterface();
@@ -78,6 +78,20 @@ function setChapterMarkMode(kind, level) {
   const statusLabel = $(`#${kind}-chapter-mark-status`); statusLabel.textContent = next ? `${chapterLevelName(next)} marking is on · click page previews · click this level again to stop.` : "Chapter marking is off.";
 }
 for (const kind of ["pdf", "book"]) for (let level = 1; level <= 3; level++) $(`#${kind}-chapter-level-${level}`).addEventListener("click", () => setChapterMarkMode(kind, level));
+function syncAutomaticChapterControl(kind) {
+  const enabled = kind === "pdf" ? state.pdfAutoChaptersEnabled : state.bookAutoChaptersEnabled, button = $(`#${kind}-auto-chapters`), analyze = $(`#${kind}-toc-analyze`);
+  button.setAttribute("aria-pressed", String(enabled)); button.textContent = `Automatic chapters: ${enabled ? "On" : "Off"}`; button.classList.toggle("enabled", enabled);
+  analyze.disabled = !enabled || (kind === "pdf" ? !state.pdf : !state.book || state.book.sourceType === "pdf");
+}
+function setAutomaticChapters(kind, enabled) {
+  if (kind === "pdf") { state.pdfAutoChaptersEnabled = enabled; state.pdfChapterScanId++; if (!enabled) state.pdfChapterScanJob = null; if (state.book?.sourceType === "pdf") state.book.autoTocEnabled = enabled; }
+  else { state.bookAutoChaptersEnabled = enabled; state.bookChapterScanId++; state.bookChapterScanJob = null; if (state.book) state.book.autoTocEnabled = enabled; }
+  syncAutomaticChapterControl(kind);
+  if (kind === "pdf") { renderPdfTableOfContents(); if (enabled && state.pdf) void analyzePdfTableOfContents(true); }
+  else { updateBookTocPreview(); if (enabled && state.book?.sourceType !== "pdf") void analyzeBookTableOfContents(true); }
+}
+for (const kind of ["pdf", "book"]) $(`#${kind}-auto-chapters`).addEventListener("click", () => setAutomaticChapters(kind, !(kind === "pdf" ? state.pdfAutoChaptersEnabled : state.bookAutoChaptersEnabled)));
+syncAutomaticChapterControl("pdf"); syncAutomaticChapterControl("book");
 function downloadBlob(blob, filename) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -261,7 +275,7 @@ async function loadPdf(file, password = "", existingBytes = null) {
     $("#pdf-queue").classList.add("show"); $("#pdf-count").textContent = `${pdf.numPages} pages · ${formatBytes(file.size)}`;
     ["#pdf-direct-download", "#pdf-delete", "#pdf-analyze", "#pdf-auto-blank"].forEach(id => $(id).disabled = false); $("#pdf-delete-unchecked").disabled = true;
     stagePdfForBook(file, pdf, bytes, password, detectedAuthor);
-    renderPdfPlaceholders(); void analyzePdfTableOfContents(); status("PDF ready · chapter analysis started automatically", 100, true);
+    renderPdfPlaceholders(); syncAutomaticChapterControl("pdf"); if (state.pdfAutoChaptersEnabled) void analyzePdfTableOfContents(); status(state.pdfAutoChaptersEnabled ? "PDF ready · automatic chapter analysis 2.0 started" : "PDF ready · automatic chapters are off", 100, true);
   } catch (e) {
     if (isPasswordError(e)) {
       const bytes = existingBytes || new Uint8Array(await file.arrayBuffer()); state.pdfPending = { file, bytes }; state.pdfFile = file;
@@ -285,7 +299,7 @@ $("#pdf-reset").addEventListener("click", () => {
   $("#pdf-direct-author").value = $("#pdf-result-author").value = "";
   ["#pdf-direct-download", "#pdf-delete", "#pdf-analyze", "#pdf-auto-blank", "#pdf-find-similar", "#pdf-delete-unchecked", "#pdf-result-download"].forEach(id => $(id).disabled = true);
   $("#pdf-reference-status").textContent = "Click a page preview to make it the blue reference."; invalidatePdfResult();
-  renderPdfTableOfContents(); $("#pdf-toc-analyze").disabled = true;
+  renderPdfTableOfContents(); $("#pdf-toc-analyze").disabled = true; syncAutomaticChapterControl("pdf");
   if (resetBookToo) { state.bookFile = state.book = state.bookPending = null; $("#book-summary").classList.remove("show"); $("#book-convert").disabled = true; }
   resetWorkspaceDisplay();
 });
@@ -303,29 +317,32 @@ function renderTocTree(list, entries, clickPage = null) {
 }
 function pdfTocEntries() {
   if (state.pdfChapterMarks.size) return [...state.pdfChapterMarks.entries()].sort((a, b) => a[0] - b[0]).map(([pageNo, mark]) => ({ index: pageNo - 1, id: `pf-chapter-${pageNo}`, label: mark.title || `Page ${pageNo}`, level: mark.level || 1 }));
+  if (!state.pdfAutoChaptersEnabled) return [];
   return state.pdfAutoChapters.map(chapter => ({ index: chapter.pageNo - 1, id: `pf-chapter-${chapter.pageNo}`, label: chapter.title, level: chapter.level || 1 }));
 }
 function renderPdfTableOfContents(message = "") {
   const list = $("#pdf-toc-list"), label = $("#pdf-toc-status"), entries = pdfTocEntries(); if (!list || !label) return;
   if (entries.length) renderTocTree(list, entries, pageNo => $(`.card[data-page="${pageNo}"]`, $("#pdf-pages"))?.scrollIntoView({ behavior: "smooth", block: "center" }));
-  else { list.innerHTML = `<li class="toc-empty">${escapeHtml(state.pdf ? "No reliable chapters detected yet. Use manual marks if needed." : "Detected chapters will appear here.")}</li>`; }
-  label.textContent = message || (state.pdfChapterMarks.size ? `MANUAL · ${entries.length} entries` : state.pdf ? `AUTO · ${entries.length} entries` : "Waiting for a PDF");
+  else { list.innerHTML = `<li class="toc-empty">${escapeHtml(state.pdf ? state.pdfAutoChaptersEnabled ? "No reliable chapters detected yet. Use manual marks if needed." : "Automatic chapters are off. Manual marks still export." : "Detected chapters will appear here.")}</li>`; }
+  label.textContent = message || (state.pdfChapterMarks.size ? `MANUAL · ${entries.length} entries` : state.pdf ? state.pdfAutoChaptersEnabled ? `AUTO 2.0 · ${entries.length} entries` : "AUTO OFF" : "Waiting for a PDF");
 }
 async function analyzePdfTableOfContents(force = false) {
-  const pdf = state.pdf; if (!pdf) return; if (state.pdfChapterScanJob && !force) return state.pdfChapterScanJob;
+  const pdf = state.pdf; if (!pdf || !state.pdfAutoChaptersEnabled) return; if (state.pdfChapterScanJob && !force) return state.pdfChapterScanJob;
   const scanId = ++state.pdfChapterScanId; $("#pdf-toc-analyze").disabled = true; renderPdfTableOfContents(`ANALYZING · 0/${pdf.numPages}`);
-  const job = (async () => { const found = [];
-    for (let pageNo = 1; pageNo <= pdf.numPages; pageNo++) { if (state.pdf !== pdf || scanId !== state.pdfChapterScanId) return; const page = await pdf.getPage(pageNo), content = await page.getTextContent(), lines = []; let line = [], fontSize = 0;
-      for (const item of content.items || []) { const value = String(item.str || "").trim(), size = Math.abs(Number(item.transform?.[3]) || Number(item.height) || 0); if (value) { line.push(value); fontSize = Math.max(fontSize, size); } if (item.hasEOL && line.length) { lines.push({ text: line.join(" "), fontSize }); line = []; fontSize = 0; } } if (line.length) lines.push({ text: line.join(" "), fontSize }); page.cleanup();
-      const detected = detectChapter(lines); if (detected.title) found.push({ pageNo, title: detected.title, level: detected.level, confidence: detected.confidence }); renderPdfTableOfContents(`ANALYZING · ${pageNo}/${pdf.numPages}`); await idleTick(80); }
-    if (state.pdf !== pdf || scanId !== state.pdfChapterScanId) return; const finalized = finalizePdfBookChapters(found.map(item => ({ ...item, navLabel: item.title }))); state.pdfAutoChapters = finalized.filter(item => item.includeInToc); renderPdfTableOfContents();
+  const job = (async () => { const pages = [];
+    for (let pageNo = 1; pageNo <= pdf.numPages; pageNo++) { if (state.pdf !== pdf || scanId !== state.pdfChapterScanId) return; try { const page = await pdf.getPage(pageNo), viewport = page.getViewport({ scale: 1 }), content = await page.getTextContent(), lines = extractPdfTextLines(content.items || [], viewport.height); page.cleanup(); pages.push({ pageNo, lines }); } catch (error) { console.warn(`Chapter analysis skipped PDF page ${pageNo}`, error); }
+      renderPdfTableOfContents(`ANALYZING · ${pageNo}/${pdf.numPages}`); await idleTick(80); }
+    if (state.pdf !== pdf || scanId !== state.pdfChapterScanId) return; state.pdfAutoChapters = analyzeChapterPages(pages);
+    for (const chapter of state.pdfAutoChapters) { const card = $(`.card[data-page="${chapter.pageNo}"]`, $("#pdf-pages")), input = card && $(".chapter-title-input", card), mark = state.pdfChapterMarks.get(chapter.pageNo); if (mark && /^Page \d+$/i.test(mark.title || "")) mark.title = chapter.title; if (!mark && input && input !== document.activeElement) input.value = chapter.title; }
+    renderPdfTableOfContents();
   })().catch(error => { if (state.pdf === pdf) { console.warn(error); renderPdfTableOfContents("Analysis could not finish"); } }).finally(() => { if (state.pdf === pdf && scanId === state.pdfChapterScanId) { state.pdfChapterScanJob = null; $("#pdf-toc-analyze").disabled = false; } }); state.pdfChapterScanJob = job; return job;
 }
 $("#pdf-toc-analyze").addEventListener("click", () => { state.pdfAutoChapters = []; void analyzePdfTableOfContents(true); });
 function markPdfChapter(pageNo) {
   const level = state.pdfChapterMarkLevel; if (!level) return selectPdfReference(pageNo);
   const card = $(`.card[data-page="${pageNo}"]`, $("#pdf-pages")), current = state.pdfChapterMarks.get(pageNo), input = card && $(".chapter-title-input", card);
-  if (current?.level === level) state.pdfChapterMarks.delete(pageNo); else state.pdfChapterMarks.set(pageNo, { level, title: cleanChapterTitle(input?.value) || `Page ${pageNo}` });
+  const automatic = state.pdfAutoChapters.find(chapter => chapter.pageNo === pageNo)?.title;
+  if (current?.level === level) state.pdfChapterMarks.delete(pageNo); else state.pdfChapterMarks.set(pageNo, { level, title: cleanChapterTitle(input?.value) || automatic || `Page ${pageNo}` });
   const mark = state.pdfChapterMarks.get(pageNo); syncChapterCard(card, mark?.level || 0, mark?.title || `Page ${pageNo}`); updatePdfChapterSummary(); renderPdfTableOfContents(); invalidatePdfResult();
 }
 function renderPdfPlaceholders() {
@@ -494,14 +511,29 @@ $("#pdf-find-similar").addEventListener("click", async () => {
 $("#pdf-delete-unchecked").addEventListener("click", async () => { try { await preparePdfWithDeleted(uncheckedPdfPages()); } catch (e) { fail(e); } });
 
 // EPUB / MOBI / PDF conversion
+function cssTypographyForNode(doc, node) {
+  let fontSize = 0, fontWeight = 0, checked = 0;
+  for (const style of $$("style", doc)) {
+    const rules = style.textContent.matchAll(/([^{}]+)\{([^{}]*)\}/g);
+    for (const rule of rules) {
+      if (++checked > 180) return { fontSize, fontWeight };
+      const selectors = rule[1].split(",").map(value => value.trim()).filter(value => value && !value.startsWith("@")).slice(0, 8);
+      let matches = false; for (const selector of selectors) try { if (node.matches(selector)) { matches = true; break; } } catch {}
+      if (!matches) continue; const size = rule[2].match(/font-size\s*:\s*([\d.]+)\s*(px|pt|em|rem|%?)/i), weight = rule[2].match(/font-weight\s*:\s*(bold|bolder|[5-9]00)/i);
+      if (size) { const value = Number(size[1]), unit = size[2].toLowerCase(); fontSize = Math.max(fontSize, unit === "pt" ? value * 1.333 : unit === "em" || unit === "rem" ? value * 16 : unit === "%" ? value * .16 : value); }
+      if (weight) fontWeight = Math.max(fontWeight, /^bold/i.test(weight[1]) ? 700 : Number(weight[1]) || 0);
+    }
+  }
+  return { fontSize, fontWeight };
+}
 function detectHtmlChapter(doc) {
   const acceptable = value => { const text = cleanChapterTitle(value); return text.length >= 2 && text.length <= 160 ? text : ""; };
   const candidates = [], seen = new Set(), add = (node, forcedLevel = 0) => {
     const text = acceptable(node?.textContent); if (!text || seen.has(text)) return; seen.add(text);
     const tagLevel = /^H[1-3]$/.test(node.tagName) ? Number(node.tagName[1]) : 0, ariaLevel = node.getAttribute?.("role") === "heading" ? Number(node.getAttribute("aria-level")) || 0 : 0;
     const className = String(node.className || ""), classLevel = /(?:part|book|volume)-?(?:title|heading)/i.test(className) ? 1 : /(?:section|scene)-?(?:title|heading)/i.test(className) ? 3 : /(?:chapter)-?(?:title|heading)/i.test(className) ? 2 : 0;
-    const weight = /bold/i.test(node.style?.fontWeight || "") ? 700 : parseFloat(node.style?.fontWeight) || 0;
-    candidates.push({ text, fontSize: parseFloat(node.style?.fontSize) || Number(node.getAttribute?.("size")) || 0, fontWeight: weight, headingLevel: forcedLevel || tagLevel || ariaLevel || classLevel });
+    const css = cssTypographyForNode(doc, node), weight = /bold/i.test(node.style?.fontWeight || "") ? 700 : parseFloat(node.style?.fontWeight) || css.fontWeight || 0;
+    candidates.push({ text, fontSize: parseFloat(node.style?.fontSize) || Number(node.getAttribute?.("size")) || css.fontSize || 0, fontWeight: weight, headingLevel: forcedLevel || tagLevel || ariaLevel || classLevel, topRatio: Math.min(.9, candidates.length * .035), pageHeight: 1 });
   };
   for (const node of $$('h1,h2,h3,[role="heading"],[epub\\:type~="title"],.chapter-title,.chapter-heading,.part-title,.part-heading,.section-title,.section-heading,[class*="chapter"][class*="title"],[id*="chapter"][id*="title"]', doc.body).slice(0, 16)) add(node);
   for (const node of $$('p,div,span', doc.body).filter(node => !node.querySelector('p,div,h1,h2,h3')).slice(0, 24)) add(node);
@@ -509,19 +541,23 @@ function detectHtmlChapter(doc) {
   return detectChapter(candidates);
 }
 function applyDetectedChapterTitle(chapter, doc) {
-  const detected = detectHtmlChapter(doc); if (!chapter.title && detected.title) { chapter.title = detected.title; chapter.navLabel = detected.title; chapter.includeInToc = false; chapter.tocSource = "detected"; chapter.tocLevel = detected.level; } return detected.title;
+  const detected = detectHtmlChapter(doc); chapter.detectedTitle = detected.title; if (chapter.tocSource !== "publisher" && !chapter.manualTocLevel && detected.title) { chapter.title = detected.title; chapter.navLabel = detected.title; chapter.includeInToc = false; chapter.tocSource = "detected"; chapter.tocLevel = detected.level; } return detected.title;
 }
-function automaticTocEntries(chapters) { return tableOfContentsEntries(finalizeAutomaticTocChapters(chapters)); }
+function automaticTocEntries(chapters, enabled = true) { return tableOfContentsEntries(finalizeAutomaticTocChapters(chapters, { autoEnabled: enabled }), { autoEnabled: enabled }); }
 function updateBookTocPreview(book = state.book) {
   const list = $("#book-toc-list"), statusLabel = $("#book-toc-status"); if (!list || !statusLabel) return; list.textContent = "";
   if (!book?.chapters?.length || book.sourceType === "pdf") { statusLabel.textContent = "Generated during book export"; return; }
-  const entries = automaticTocEntries(book.chapters), tree = tableOfContentsTree(entries), manual = book.chapters.some(chapter => Number(chapter.manualTocLevel) >= 1), append = (parent, nodes) => { for (const node of nodes) { const item = document.createElement("li"); if (node.children.length) { const details = document.createElement("details"), summary = document.createElement("summary"), children = document.createElement("ol"); summary.textContent = node.label; details.append(summary); append(children, node.children); details.append(children); item.append(details); } else { item.className = "toc-leaf"; item.textContent = node.label; } parent.append(item); } }; append(list, tree);
-  const analyzed = book.chapters.filter(chapter => chapter.loaded).length; statusLabel.textContent = `${manual ? "MANUAL" : "AUTO"} · ${entries.length} entries · ${analyzed}/${book.chapters.length} pages analyzed`;
+  const enabled = book.autoTocEnabled !== false && state.bookAutoChaptersEnabled, entries = automaticTocEntries(book.chapters, enabled), tree = tableOfContentsTree(entries), manual = book.chapters.some(chapter => Number(chapter.manualTocLevel) >= 1), append = (parent, nodes) => { for (const node of nodes) { const item = document.createElement("li"); if (node.children.length) { const details = document.createElement("details"), summary = document.createElement("summary"), children = document.createElement("ol"); summary.textContent = node.label; details.append(summary); append(children, node.children); details.append(children); item.append(details); } else { item.className = "toc-leaf"; item.textContent = node.label; } parent.append(item); } }; append(list, tree);
+  if (!entries.length) list.innerHTML = `<li class="toc-empty">${enabled ? "No reliable chapters detected yet. Manual marks always export." : "Automatic chapters are off. Manual marks still export."}</li>`;
+  const analyzed = book.chapters.filter(chapter => chapter.loaded).length, skipped = Number(book.chapterAnalysisFailures) || 0; statusLabel.textContent = `${manual ? "MANUAL" : enabled ? "AUTO 2.0" : "AUTO OFF"} · ${entries.length} entries · ${analyzed}/${book.chapters.length} pages analyzed${skipped ? ` · ${skipped} skipped` : ""}`;
+}
+function syncBookChapterCards(book = state.book) {
+  if (!book?.chapters) return; book.chapters.forEach((chapter, index) => { const card = $(`.card[data-page="${index + 1}"]`, $("#book-pages")); if (!card) return; const label = chapterNavigationLabel(chapter, index), filename = $(".filename", card), input = $(".chapter-title-input", card); filename.textContent = label; filename.title = label; if (!chapter.manualTocLevel && input !== document.activeElement) input.value = label; syncChapterCard(card, Number(chapter.manualTocLevel) || 0, chapter.manualTocTitle || label); });
 }
 async function analyzeBookTableOfContents(force = false) {
-  const book = state.book; if (!book?.chapters?.length || book.sourceType === "pdf") return;
+  const book = state.book; if (!book?.chapters?.length || book.sourceType === "pdf" || !state.bookAutoChaptersEnabled) return; if (state.bookChapterScanJob && !force) return state.bookChapterScanJob;
   if (force) for (const chapter of book.chapters) if (chapter.tocSource !== "publisher" && !chapter.manualTocLevel) { chapter.loaded = false; chapter.loading = null; chapter.title = ""; chapter.navLabel = `Section ${book.chapters.indexOf(chapter) + 1}`; chapter.tocSource = "unknown"; }
-  $("#book-toc-analyze").disabled = true; try { for (let index = 0; index < book.chapters.length; index++) { if (state.book !== book) return; await loadBookChapter(book, index); updateBookTocPreview(book); await idleTick(80); } book.chapters = finalizeAutomaticTocChapters(book.chapters); updateBookTocPreview(book); } finally { if (state.book === book) $("#book-toc-analyze").disabled = false; }
+  const scanId = ++state.bookChapterScanId; $("#book-toc-analyze").disabled = true; const job = (async () => { let failures = 0; for (let index = 0; index < book.chapters.length; index++) { if (state.book !== book || scanId !== state.bookChapterScanId) return; try { await loadBookChapter(book, index); } catch (error) { failures++; console.warn(`Chapter analysis skipped ebook page ${index + 1}`, error); } updateBookTocPreview(book); await idleTick(80); } book.chapterAnalysisFailures = failures; const finalized = finalizeAutomaticTocChapters(book.chapters, { autoEnabled: state.bookAutoChaptersEnabled }); finalized.forEach((chapter, index) => Object.assign(book.chapters[index], chapter)); syncBookChapterCards(book); updateBookTocPreview(book); })().catch(error => { if (state.book === book) { console.warn(error); $("#book-toc-status").textContent = "Analysis could not finish · manual marks still work"; } }).finally(() => { if (state.book === book && scanId === state.bookChapterScanId) { state.bookChapterScanJob = null; syncAutomaticChapterControl("book"); } }); state.bookChapterScanJob = job; return job;
 }
 function markBookChapter(pageNo) {
   const level = state.bookChapterMarkLevel; if (!level) return selectBookReference(pageNo);
@@ -569,7 +605,7 @@ function showBookDetails(book, file) {
   $("#book-type").textContent = book.sourceType.toUpperCase(); $("#book-name").value = book.title || file.name.replace(/\.[^.]+$/, ""); $("#book-author").value = book.author || ""; $("#book-convert").disabled = false;
 }
 function stagePdfForBook(file, pdf, bytes, password, author = "") {
-  const book = { sourceType: "pdf", title: file.name.replace(/\.pdf$/i, ""), author, pageCount: pdf.numPages, pdf, chapters: [], bytes, password, assets: [] };
+  const book = { sourceType: "pdf", title: file.name.replace(/\.pdf$/i, ""), author, pageCount: pdf.numPages, pdf, chapters: [], bytes, password, assets: [], autoTocEnabled: state.pdfAutoChaptersEnabled };
   state.bookFile = file; state.book = book; state.bookPending = null; state.bookPassword = password; $("#book-password-box").classList.remove("show"); $("#book-password").value = ""; showBookDetails(book, file);
 }
 async function loadBook(file, password = "") {
@@ -581,7 +617,7 @@ async function loadBook(file, password = "") {
     if (type === "epub") book = await parseEpub(file);
     else if (type === "pdf") book = await pdfAsBook(file, false, password);
     else book = await parseMobi(file);
-    state.book = book; state.bookPending = null; state.bookPassword = password; state.bookChapterMarkLevel = 0; setChapterMarkMode("book", 0); $("#book-password-box").classList.remove("show"); $("#book-password").value = ""; showBookDetails(book, file); if (book.sourceType !== "pdf") { renderBookPlaceholders(); $("#book-toc-analyze").disabled = false; void analyzeBookTableOfContents(); } status("Book ready · chapter analysis started automatically", 100, true);
+    book.autoTocEnabled = state.bookAutoChaptersEnabled; state.book = book; state.bookPending = null; state.bookPassword = password; state.bookChapterMarkLevel = 0; state.bookChapterScanId++; state.bookChapterScanJob = null; setChapterMarkMode("book", 0); $("#book-password-box").classList.remove("show"); $("#book-password").value = ""; showBookDetails(book, file); syncAutomaticChapterControl("book"); if (book.sourceType !== "pdf") { renderBookPlaceholders(); if (state.bookAutoChaptersEnabled) void analyzeBookTableOfContents(); } status(state.bookAutoChaptersEnabled ? "Book ready · automatic chapter analysis 2.0 started" : "Book ready · automatic chapters are off", 100, true);
   } catch (e) {
     if (file.name.toLowerCase().endsWith(".pdf") && isPasswordError(e)) {
       state.book = null; state.bookPending = { file }; state.bookFile = file;
@@ -597,7 +633,7 @@ $("#book-password").addEventListener("keydown", e => { if (e.key === "Enter") $(
 $("#book-reset").addEventListener("click", () => {
   if ((state.book?.sourceType === "pdf" && state.pdf) || (state.pdfPending && state.bookFile === state.pdfFile)) { $("#pdf-reset").click(); return; }
   state.bookPageObserver?.disconnect(); state.book?.dispose?.(); state.book?.pdf?.destroy?.();
-  state.bookFile = state.book = state.bookPending = null; state.bookPassword = ""; state.bookChapterMarkLevel = 0; setChapterMarkMode("book", 0);
+  state.bookFile = state.book = state.bookPending = null; state.bookPassword = ""; state.bookChapterMarkLevel = 0; state.bookChapterScanId++; state.bookChapterScanJob = null; setChapterMarkMode("book", 0);
   state.bookBlankness.clear(); state.bookAnalysisJobs.clear(); state.bookFingerprints.clear(); state.bookReferencePage = null; state.bookBlankScanId++;
   $("#book-summary").classList.remove("show");
   $("#book-page-queue").classList.remove("show"); $("#book-pages").textContent = "";
@@ -606,7 +642,7 @@ $("#book-reset").addEventListener("click", () => {
   $("#book-name").value = $("#book-author").value = "";
   $("#book-delete-range").value = ""; $("#book-reference-status").textContent = "Click a page preview to make it the blue reference.";
   $("#book-toc-list").textContent = ""; $("#book-toc-status").textContent = "Waiting for a book";
-  $("#book-toc-analyze").disabled = true;
+  $("#book-toc-analyze").disabled = true; syncAutomaticChapterControl("book");
   configureBookMode("ebook");
   resetWorkspaceDisplay();
 });
@@ -772,11 +808,11 @@ async function parseEpub(file) {
   const coverPath = cover?.href || (guideHref ? normalizePath(base + guideHref) : "");
   if (coverPath && !chapters.some(chapter => chapter.path === coverPath) && zip.file(coverPath)) chapters.unshift({ title: "Cover", navLabel: "Cover", includeInToc: false, tocSource: "cover", tocLevel: 1, html: "", loaded: false, kind: mimeFromPath(coverPath).startsWith("image/") ? "epub-image" : "epub-html", path: coverPath, assets: [] });
   if (!chapters.length) throw new Error("No readable EPUB chapters were found.");
-  const assetCache = new Map(), book = { sourceType: "epub", title, author, chapters, assets: [], visualCount: imageItems.length, lazy: true, source: { zip, assetCache, assetPaths: imageItems.map(item => item.href) } };
+  const assetCache = new Map(), book = { sourceType: "epub", title, author, chapters, assets: [], visualCount: imageItems.length, lazy: true, autoTocEnabled: state.bookAutoChaptersEnabled, source: { zip, assetCache, assetPaths: imageItems.map(item => item.href) } };
   book.loadChapter = async (chapter, index) => {
     const assets = new Set();
     if (chapter.kind === "epub-image") { const data = await zipAssetData(zip, chapter.path, assets, assetCache); chapter.html = data ? `<div style="text-align:center"><img alt="Cover" src="${data}"></div>` : ""; }
-    else { const markup = await zip.file(chapter.path)?.async("text"); if (!markup) throw new Error(`EPUB page ${index + 1} is missing.`); const chapterDoc = new DOMParser().parseFromString(markup, "text/html"); applyDetectedChapterTitle(chapter, chapterDoc); chapter.html = await inlineEpubChapter(markup, chapter.path, zip, assets, assetCache); }
+    else { const markup = await zip.file(chapter.path)?.async("text"); if (!markup) throw new Error(`EPUB page ${index + 1} is missing.`); chapter.html = await inlineEpubChapter(markup, chapter.path, zip, assets, assetCache); applyDetectedChapterTitle(chapter, new DOMParser().parseFromString(chapter.html, "text/html")); }
     chapter.assets = [...assets]; return chapter;
   };
   return book;
@@ -788,7 +824,7 @@ async function parseMobi(file) {
   for (let i = 0; i < spine.length; i++) { const tocEntry = tocTitles.get(String(spine[i].id)), chapterTitle = tocEntry?.label || ""; chapters.push({ title: chapterTitle, navLabel: chapterTitle || `Section ${i + 1}`, includeInToc: Boolean(tocEntry), tocSource: tocEntry ? "publisher" : "unknown", tocLevel: tocEntry?.level || 1, html: "", loaded: false, kind: "mobi-html", mobiId: spine[i].id, assets: [] }); }
   const coverUrl = mobi.getCoverImage?.(); if (coverUrl) chapters.unshift({ title: "Cover", navLabel: "Cover", includeInToc: false, tocSource: "cover", tocLevel: 1, html: "", loaded: false, kind: "mobi-cover", sourceUrl: coverUrl, assets: [] });
   if (!chapters.length) { mobi.destroy(); throw new Error("No readable MOBI/KF8 sections were found."); }
-  const authorValues = Array.isArray(meta.author) ? meta.author : meta.author ? [meta.author] : [], book = { sourceType: sourceExt === "azm3" ? "azm3" : preferKf8 ? "azw3" : "mobi", title: meta.title || file.name.replace(/\.[^.]+$/, ""), author: authorValues.join(", "), chapters, assets: [], visualCount: undefined, lazy: true, source: { mobi } };
+  const authorValues = Array.isArray(meta.author) ? meta.author : meta.author ? [meta.author] : [], book = { sourceType: sourceExt === "azm3" ? "azm3" : preferKf8 ? "azw3" : "mobi", title: meta.title || file.name.replace(/\.[^.]+$/, ""), author: authorValues.join(", "), chapters, assets: [], visualCount: undefined, lazy: true, autoTocEnabled: state.bookAutoChaptersEnabled, source: { mobi } };
   book.loadChapter = async (chapter, index) => {
     const assets = new Set();
     if (chapter.kind === "mobi-cover") { const data = await blobToDataURL(await (await realFetch(chapter.sourceUrl)).blob()); if (data.startsWith("data:image/")) assets.add(data); chapter.html = `<img alt="Cover" src="${data}">`; }
@@ -813,7 +849,7 @@ async function materializeBook(book) {
       await zipAssetData(book.source.zip, path, assets, book.source.assetCache); await tick();
     });
   }
-  return { ...book, chapters: finalizeAutomaticTocChapters(book.chapters.map(chapter => ({ ...chapter, html: chapter.html || "" }))), assets: [...assets], lazy: false };
+  return { ...book, chapters: finalizeAutomaticTocChapters(book.chapters.map(chapter => ({ ...chapter, html: chapter.html || "" })), { autoEnabled: book.autoTocEnabled !== false }), assets: [...assets], lazy: false };
 }
 async function inlineBlobCss(css, assets) {
   const re = /url\(\s*(['"]?)(blob:[^)'"]+)\1\s*\)/gi; let out = "", at = 0, match;
@@ -828,18 +864,18 @@ async function inlineBlobImages(html, assets = new Set()) {
   $$('script,iframe,object,embed', doc).forEach(x => x.remove()); return $$("style", doc.head).map(x => x.outerHTML).join("") + doc.body.innerHTML;
 }
 async function pdfAsBook(file, renderPages = true, password = "", existingBytes = null) {
-  const bytes = existingBytes || new Uint8Array(await file.arrayBuffer()), pdf = await pdfjsLib.getDocument({ data: bytes.slice(), password: password || undefined }).promise, pdfMetadata = await pdf.getMetadata().catch(() => ({})); const book = { sourceType: "pdf", title: file.name.replace(/\.pdf$/i, ""), author: cleanChapterTitle(pdfMetadata?.info?.Author), pageCount: pdf.numPages, pdf, chapters: [], bytes, password, assets: [] };
+  const bytes = existingBytes || new Uint8Array(await file.arrayBuffer()), pdf = await pdfjsLib.getDocument({ data: bytes.slice(), password: password || undefined }).promise, pdfMetadata = await pdf.getMetadata().catch(() => ({})); const book = { sourceType: "pdf", title: file.name.replace(/\.pdf$/i, ""), author: cleanChapterTitle(pdfMetadata?.info?.Author), pageCount: pdf.numPages, pdf, chapters: [], bytes, password, assets: [], autoTocEnabled: state.pdfAutoChaptersEnabled }, analyzedPages = [];
   if (renderPages) for (let i = 1; i <= pdf.numPages; i++) {
     status(`Extracting text and artwork from PDF page ${i} of ${pdf.numPages}`, 8 + (i / pdf.numPages) * 80);
-    const page = await pdf.getPage(i), content = await page.getTextContent(), operators = await page.getOperatorList(), lines = []; let line = [], lineFontSize = 0;
-    for (const item of content.items || []) { const value = String(item.str || "").trim(), fontSize = Math.abs(Number(item.transform?.[3]) || Number(item.height) || 0); if (value) { line.push(value); lineFontSize = Math.max(lineFontSize, fontSize); } if (item.hasEOL && line.length) { lines.push({ text: line.join(" "), fontSize: lineFontSize }); line = []; lineFontSize = 0; } }
-    if (line.length) lines.push({ text: line.join(" "), fontSize: lineFontSize });
+    const page = await pdf.getPage(i), viewport = page.getViewport({ scale: 1 }), content = await page.getTextContent(), operators = await page.getOperatorList(), lines = extractPdfTextLines(content.items || [], viewport.height); analyzedPages.push({ pageNo: i, lines });
     const visualOps = new Set([pdfjsLib.OPS.stroke, pdfjsLib.OPS.closeStroke, pdfjsLib.OPS.fill, pdfjsLib.OPS.eoFill, pdfjsLib.OPS.fillStroke, pdfjsLib.OPS.eoFillStroke, pdfjsLib.OPS.closeFillStroke, pdfjsLib.OPS.closeEOFillStroke, pdfjsLib.OPS.shadingFill, pdfjsLib.OPS.paintXObject, pdfjsLib.OPS.paintFormXObjectBegin, pdfjsLib.OPS.paintImageMaskXObject, pdfjsLib.OPS.paintImageMaskXObjectGroup, pdfjsLib.OPS.paintImageXObject, pdfjsLib.OPS.paintInlineImageXObject, pdfjsLib.OPS.paintInlineImageXObjectGroup, pdfjsLib.OPS.paintImageXObjectRepeat, pdfjsLib.OPS.paintImageMaskXObjectRepeat, pdfjsLib.OPS.paintSolidColorImageMask, pdfjsLib.OPS.rawFillPath].filter(Number.isFinite)), hasVisualArt = operators.fnArray.some(op => visualOps.has(op)); page.cleanup();
     const data = hasVisualArt ? await blobToDataURL(await renderPdfPage(pdf, i, 1.45, "jpeg", .9)) : "", chapter = createPdfBookChapter({ pageNo: i, lines, hasVisualArt, imageData: data });
     if (chapter) { book.assets.push(...chapter.assets); book.chapters.push(chapter); } await tick();
   }
-  if (state.pdfChapterMarks.size) book.chapters = finalizeAutomaticTocChapters(book.chapters.map(chapter => { const mark = state.pdfChapterMarks.get(chapter.sourcePageNo); return mark ? { ...chapter, manualTocLevel: mark.level, manualTocTitle: mark.title, tocSource: "manual" } : chapter; }));
-  else book.chapters = finalizePdfBookChapters(book.chapters); return book;
+  const detectedByPage = new Map(analyzeChapterPages(analyzedPages).map(chapter => [chapter.pageNo, chapter]));
+  book.chapters = book.chapters.map(chapter => { const detected = detectedByPage.get(chapter.sourcePageNo); return detected ? { ...chapter, title: detected.title, navLabel: detected.title, tocLevel: detected.level, tocSource: "detected" } : { ...chapter, title: "", navLabel: `Page ${chapter.sourcePageNo}` }; });
+  if (state.pdfChapterMarks.size) book.chapters = finalizeAutomaticTocChapters(book.chapters.map(chapter => { const mark = state.pdfChapterMarks.get(chapter.sourcePageNo); return mark ? { ...chapter, manualTocLevel: mark.level, manualTocTitle: mark.title, tocSource: "manual" } : chapter; }), { autoEnabled: state.pdfAutoChaptersEnabled });
+  else book.chapters = state.pdfAutoChaptersEnabled ? finalizePdfBookChapters(book.chapters) : finalizeAutomaticTocChapters(book.chapters, { autoEnabled: false }); return book;
 }
 function filterHtml(html, mode) {
   if (mode === "all") return html;
@@ -871,13 +907,14 @@ function filteredBook(book, mode) {
 
 if (!canStreamFile()) $("#photo-engine-note").textContent = "This browser does not expose direct disk streaming. PageForge will use universal memory mode; Chrome or Edge can write progressively to disk on Windows and macOS.";
 async function downloadBookArtifact(book, output, title) {
+  const expectedToc = book.filterMode === "images" ? [] : tableOfContentsEntries(book.chapters, { autoEnabled: book.autoTocEnabled !== false }), countReaderToc = items => (items || []).reduce((total, item) => total + 1 + countReaderToc(item.children), 0);
   if (output === "pdf") downloadBlob(await bookToPdf(book), `${title}.pdf`);
   else if (output === "epub") {
-    const epub = await buildEpub(book), check = await JSZip.loadAsync(epub); if (!check.file("META-INF/container.xml")) throw new Error("EPUB package verification failed."); downloadBlob(epub, `${title}.epub`);
+    const epub = await buildEpub(book), check = await JSZip.loadAsync(epub), nav = await check.file("OEBPS/nav.xhtml")?.async("text"), ncx = await check.file("OEBPS/toc.ncx")?.async("text"); if (!check.file("META-INF/container.xml") || !nav || !ncx || expectedToc.some(entry => !nav.includes(escapeHtml(entry.label)) || !ncx.includes(escapeHtml(entry.label)))) throw new Error("EPUB navigation verification failed."); downloadBlob(epub, `${title}.epub`);
   } else if (output === "mobi") {
-    const mobiBytes = buildMobi(book), check = await initMobiFile(new File([mobiBytes], `${title}.mobi`, { type: "application/x-mobipocket-ebook" })); if (!check.getSpine().length) throw new Error("MOBI package verification failed."); check.destroy(); downloadBlob(bytesToBlob(mobiBytes, "application/x-mobipocket-ebook"), `${title}.mobi`);
+    const mobiBytes = buildMobi(book), check = await initMobiFile(new File([mobiBytes], `${title}.mobi`, { type: "application/x-mobipocket-ebook" })), actualToc = countReaderToc(check.getToc?.()); if (!check.getSpine().length || actualToc !== expectedToc.length) throw new Error(`MOBI reader navigation verification failed: expected ${expectedToc.length} chapters, found ${actualToc}.`); check.destroy(); downloadBlob(bytesToBlob(mobiBytes, "application/x-mobipocket-ebook"), `${title}.mobi`);
   } else {
-    const azwBytes = buildAzw3(book), extension = output === "azm3" ? "azm3" : "azw3", check = await initKf8File(new File([azwBytes], `${title}.${extension}`, { type: "application/vnd.amazon.ebook" })); const first = check.getSpine()[0]; if (!first || !check.loadChapter(first.id)?.html) throw new Error("KF8 package verification failed."); check.destroy(); downloadBlob(bytesToBlob(azwBytes, "application/vnd.amazon.ebook"), `${title}.${extension}`);
+    const azwBytes = buildAzw3(book), extension = output === "azm3" ? "azm3" : "azw3", check = await initKf8File(new File([azwBytes], `${title}.${extension}`, { type: "application/vnd.amazon.ebook" })); const first = check.getSpine()[0], actualToc = countReaderToc(check.getToc?.()); if (!first || !check.loadChapter(first.id)?.html || actualToc !== expectedToc.length) throw new Error(`KF8 reader navigation verification failed: expected ${expectedToc.length} chapters, found ${actualToc}.`); check.destroy(); downloadBlob(bytesToBlob(azwBytes, "application/vnd.amazon.ebook"), `${title}.${extension}`);
   }
 }
 $("#book-convert").addEventListener("click", async () => {
@@ -966,7 +1003,7 @@ async function makePrintPages(chapter) {
 }
 async function bookToPdf(book) {
   const pdf = await PDFDocument.create(); pdf.setTitle(book.title || "PageForge book"); if (book.author) pdf.setAuthor(book.author);
-  const visibleToc = book.filterMode === "images" ? "" : buildVisibleTableOfContents(book.chapters);
+  const visibleToc = book.filterMode === "images" ? "" : buildVisibleTableOfContents(book.chapters, { autoEnabled: book.autoTocEnabled !== false });
   const chapters = visibleToc ? [{ title: "Contents", html: visibleToc, includeInToc: false }, ...book.chapters] : book.chapters;
   const total = chapters.length;
   for (let i = 0; i < total; i++) {
@@ -979,6 +1016,10 @@ async function bookToPdf(book) {
   if (!pdf.getPageCount()) pdf.addPage([595.28, 841.89]); status("Finalizing PDF", 94); return bytesToBlob(await pdf.save({ useObjectStreams: true }), "application/pdf");
 }
 function xhtmlDocument(title, body) { return `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><head><meta charset="utf-8"/><title>${escapeHtml(title)}</title><style>body{font-family:serif;line-height:1.55;margin:5%;}img{max-width:100%;height:auto;}svg{max-width:100%;}</style></head><body>${body}</body></html>`; }
+function epubNcxDocument(book, uid, entries) {
+  let playOrder = 0; const render = nodes => nodes.map(node => `<navPoint id="nav-${++playOrder}" playOrder="${playOrder}"><navLabel><text>${escapeHtml(node.label)}</text></navLabel><content src="text/chapter-${node.index + 1}.xhtml"/>${render(node.children)}</navPoint>`).join("");
+  return `<?xml version="1.0" encoding="UTF-8"?><ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1"><head><meta name="dtb:uid" content="${escapeHtml(uid)}"/></head><docTitle><text>${escapeHtml(book.title || "PageForge book")}</text></docTitle>${book.author ? `<docAuthor><text>${escapeHtml(book.author)}</text></docAuthor>` : ""}<navMap>${render(tableOfContentsTree(entries))}</navMap></ncx>`;
+}
 async function buildEpub(book) {
   status("Packaging EPUB", 20); const zip = new JSZip(); zip.file("mimetype", "application/epub+zip", { compression: "STORE" }); zip.file("META-INF/container.xml", `<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>`);
   const imageItems = [], chapterItems = []; let imageNo = 0;
@@ -987,9 +1028,10 @@ async function buildEpub(book) {
     for (const img of $$("img[src^='data:']", doc)) { const { bytes, mime } = dataUrlToBytes(img.getAttribute("src")); const ext = extFromMime(mime); const name = `image-${++imageNo}.${ext}`; zip.file(`OEBPS/images/${name}`, bytes); img.setAttribute("src", `../images/${name}`); imageItems.push(`<item id="img${imageNo}" href="images/${name}" media-type="${mime}"/>`); }
     $$('script,iframe,object,embed', doc).forEach(x => x.remove()); const id = `ch${i + 1}`, name = `chapter-${i + 1}.xhtml`, label = chapterNavigationLabel(book.chapters[i], i); zip.file(`OEBPS/text/${name}`, xhtmlDocument(label, doc.body.innerHTML)); chapterItems.push(`<item id="${id}" href="text/${name}" media-type="application/xhtml+xml"/>`); status(`Packaging section ${i + 1} of ${book.chapters.length}`, 20 + (i / book.chapters.length) * 60); await tick();
   }
-  const navLinks = buildNestedTocList(tableOfContentsEntries(book.chapters), entry => `text/chapter-${entry.index + 1}.xhtml`);
+  const tocEntries = tableOfContentsEntries(book.chapters, { autoEnabled: book.autoTocEnabled !== false }), navLinks = buildNestedTocList(tocEntries, entry => `text/chapter-${entry.index + 1}.xhtml`);
   const uid = `urn:uuid:${crypto.randomUUID()}`; zip.file("OEBPS/nav.xhtml", xhtmlDocument("Contents", `<nav epub:type="toc" xmlns:epub="http://www.idpf.org/2007/ops"><h1>Contents</h1>${navLinks}</nav>`));
-  zip.file("OEBPS/content.opf", `<?xml version="1.0" encoding="UTF-8"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="uid">${uid}</dc:identifier><dc:title>${escapeHtml(book.title)}</dc:title><dc:creator>${escapeHtml(book.author || "")}</dc:creator><dc:language>en</dc:language><meta property="dcterms:modified">${new Date().toISOString().replace(/\.\d{3}Z$/, "Z")}</meta></metadata><manifest><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>${chapterItems.join("")}${imageItems.join("")}</manifest><spine>${book.chapters.map((_, i) => `<itemref idref="ch${i + 1}"/>`).join("")}</spine></package>`);
+  zip.file("OEBPS/toc.ncx", epubNcxDocument(book, uid, tocEntries));
+  zip.file("OEBPS/content.opf", `<?xml version="1.0" encoding="UTF-8"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="uid">${uid}</dc:identifier><dc:title>${escapeHtml(book.title)}</dc:title><dc:creator>${escapeHtml(book.author || "")}</dc:creator><dc:language>en</dc:language><meta property="dcterms:modified">${new Date().toISOString().replace(/\.\d{3}Z$/, "Z")}</meta></metadata><manifest><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/><item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>${chapterItems.join("")}${imageItems.join("")}</manifest><spine toc="ncx">${book.chapters.map((_, i) => `<itemref idref="ch${i + 1}"/>`).join("")}</spine><guide><reference type="toc" title="Contents" href="nav.xhtml"/></guide></package>`);
   return zip.generateAsync({ type: "blob", mimeType: "application/epub+zip", compression: "DEFLATE", compressionOptions: { level: 6 } }, p => status("Compressing EPUB", 80 + p.percent * .18));
 }
 function writeU16(view, at, value) { view.setUint16(at, value >>> 0, false); }
@@ -1001,15 +1043,28 @@ function makeExth(book) {
   const records = [exthRecord(503, book.title || "PageForge book"), exthRecord(524, "en")]; if (book.author) records.unshift(exthRecord(100, book.author));
   const rawLength = 12 + records.reduce((n, x) => n + x.length, 0), padded = (rawLength + 3) & ~3, out = new Uint8Array(padded), v = new DataView(out.buffer); writeAscii(out, 0, "EXTH"); writeU32(v, 4, padded); writeU32(v, 8, records.length); let at = 12; records.forEach(r => { out.set(r, at); at += r.length; }); return out;
 }
+function positionMarker(prefix, index = 0) { return `${prefix}${String(index).padStart(10 - prefix.length, "0")}`.slice(0, 10); }
+function legacyMobiToc(entries, markerFor) {
+  const render = nodes => nodes.map(node => `<blockquote><a filepos="${markerFor(node.index)}">${escapeHtml(node.label)}</a>${node.children.length ? render(node.children) : ""}</blockquote>`).join("");
+  return render(tableOfContentsTree(entries));
+}
+function resolveMobiFilePositions(html, markers) {
+  let resolved = html;
+  for (const marker of markers) {
+    const token = `id="filepos:${marker}"`, at = html.indexOf(token); if (at < 0) continue;
+    const offset = enc.encode(html.slice(0, at)).length, value = String(offset).padStart(10, "0"); resolved = resolved.replaceAll(marker, value);
+  }
+  return resolved;
+}
 function buildMobi(book) {
-  status("Compiling classic MOBI", 20); const images = []; let imageNo = 0; const sections = [];
+  status("Compiling classic MOBI", 20); const images = []; let imageNo = 0; const sections = [], markers = book.chapters.map((_, index) => positionMarker("C", index + 1));
   for (let chapterNo = 0; chapterNo < book.chapters.length; chapterNo++) { const chapter = book.chapters[chapterNo];
     const doc = new DOMParser().parseFromString(chapter.html, "text/html");
     for (const img of $$("img[src^='data:']", doc)) { const { bytes } = dataUrlToBytes(img.getAttribute("src")); images.push(bytes); img.removeAttribute("src"); img.setAttribute("recindex", String(++imageNo)); }
-    $$('style,script,iframe,object,embed,svg', doc).forEach(x => x.remove()); sections.push(wrapMobiChapter(doc.body.innerHTML, `pf-chapter-${chapterNo + 1}`));
+    $$('style,script,iframe,object,embed,svg', doc).forEach(x => x.remove()); sections.push(wrapMobiChapter(doc.body.innerHTML, `filepos:${markers[chapterNo]}`));
   }
-  const body = composeLegacyBookBody({ chapters: book.chapters, sections, filterMode: book.filterMode, separator: "<mbp:pagebreak/>" });
-  const html = `<html><head><title>${escapeHtml(book.title)}</title></head><body>${body}</body></html>`, text = enc.encode(html), chunks = []; for (let at = 0; at < text.length; at += 4096) chunks.push(text.slice(at, at + 4096)); if (!chunks.length) chunks.push(new Uint8Array());
+  const tocEntries = book.filterMode === "images" ? [] : tableOfContentsEntries(book.chapters, { autoEnabled: book.autoTocEnabled !== false }), tocMarker = positionMarker("T"), toc = tocEntries.length ? `<a id="filepos:${tocMarker}"></a><h1>Contents</h1>${legacyMobiToc(tocEntries, index => markers[index])}` : "", body = `${toc}${toc ? "<mbp:pagebreak/>" : ""}${sections.join("<mbp:pagebreak/>")}`;
+  const unresolved = `<html><head><title>${escapeHtml(book.title)}</title>${toc ? `<reference type="toc" title="Contents" filepos=${tocMarker} />` : ""}</head><body>${body}</body></html>`, html = resolveMobiFilePositions(unresolved, toc ? [tocMarker, ...markers] : markers), text = enc.encode(html), chunks = []; for (let at = 0; at < text.length; at += 4096) chunks.push(text.slice(at, at + 4096)); if (!chunks.length) chunks.push(new Uint8Array());
   const exth = makeExth(book), titleBytes = enc.encode(book.title || "PageForge book"), record0 = new Uint8Array(248 + exth.length + titleBytes.length), rv = new DataView(record0.buffer), resourceStart = 1 + chunks.length;
   writeU16(rv, 0, 1); writeU32(rv, 4, text.length); writeU16(rv, 8, chunks.length); writeU16(rv, 10, 4096); writeU16(rv, 12, 0); writeAscii(record0, 16, "MOBI"); writeU32(rv, 20, 232); writeU32(rv, 24, 2); writeU32(rv, 28, 65001); writeU32(rv, 32, Math.floor(Date.now() / 1000)); writeU32(rv, 36, 6);
   [40, 44, 48, 52, 64, 68, 72, 112, 164, 244].forEach(at => writeU32(rv, at, 0xffffffff)); writeU32(rv, 84, 248 + exth.length); writeU32(rv, 88, titleBytes.length); writeU32(rv, 92, 0x00000409); writeU32(rv, 104, 6); writeU32(rv, 108, resourceStart); writeU32(rv, 128, 0x40); writeU32(rv, 240, 0); record0.set(exth, 248); record0.set(titleBytes, 248 + exth.length);
@@ -1025,8 +1080,8 @@ function makeTagx(tags, controlBytes = 1) {
   const out = new Uint8Array(12 + tags.length * 4), view = new DataView(out.buffer); writeAscii(out, 0, "TAGX"); writeU32(view, 4, out.length); writeU32(view, 8, controlBytes);
   tags.forEach((tag, i) => out.set(tag, 12 + i * 4)); return out;
 }
-function makeIndexMaster(tags, numRecords, totalEntries, controlBytes = 1) {
-  const headerLength = 56, tagx = makeTagx(tags, controlBytes), out = new Uint8Array(headerLength + tagx.length), view = new DataView(out.buffer); writeAscii(out, 0, "INDX"); writeU32(view, 4, headerLength); writeU32(view, 8, 0); writeU32(view, 20, 0xffffffff); writeU32(view, 24, numRecords); writeU32(view, 28, 65001); writeU32(view, 32, 0x00000409); writeU32(view, 36, totalEntries); writeU32(view, 40, 0xffffffff); writeU32(view, 44, 0xffffffff); writeU32(view, 48, 0); writeU32(view, 52, 0); out.set(tagx, headerLength); return out;
+function makeIndexMaster(tags, numRecords, totalEntries, controlBytes = 1, numCncx = 0) {
+  const headerLength = 56, tagx = makeTagx(tags, controlBytes), out = new Uint8Array(headerLength + tagx.length), view = new DataView(out.buffer); writeAscii(out, 0, "INDX"); writeU32(view, 4, headerLength); writeU32(view, 8, 0); writeU32(view, 20, 0xffffffff); writeU32(view, 24, numRecords); writeU32(view, 28, 65001); writeU32(view, 32, 0x00000409); writeU32(view, 36, totalEntries); writeU32(view, 40, 0xffffffff); writeU32(view, 44, 0xffffffff); writeU32(view, 48, 0); writeU32(view, 52, numCncx); out.set(tagx, headerLength); return out;
 }
 function makeIndexRecord(entries, controlBytes = 1) {
   const encoded = entries.map(entry => {
@@ -1036,6 +1091,17 @@ function makeIndexRecord(entries, controlBytes = 1) {
   encoded.forEach(entry => { offsets.push(at); out.set(entry, at); at += entry.length; }); writeAscii(out, idxt, "IDXT"); offsets.forEach((offset, i) => writeU16(view, idxt + 4 + i * 2, offset)); return out;
 }
 function makeFdst(length) { const out = new Uint8Array(20), view = new DataView(out.buffer); writeAscii(out, 0, "FDST"); writeU32(view, 4, 20); writeU32(view, 8, 1); writeU32(view, 12, 0); writeU32(view, 16, length); return out; }
+function makeCncxRecord(labels) {
+  const parts = [], offsets = []; let offset = 0;
+  for (const label of labels) { const value = enc.encode(label), length = encodeVarLen(value.length), part = joinBytes([length, value]); offsets.push(offset); parts.push(part); offset += part.length; }
+  return { bytes: joinBytes(parts), offsets };
+}
+function makeKf8Navigation(entries, rawOffsets, rawLengths) {
+  const flat = [], visit = (nodes, parent = null) => { for (const node of nodes) { const item = { node, index: flat.length, parent, firstChild: null, lastChild: null }; flat.push(item); const start = flat.length; visit(node.children, item.index); if (flat.length > start) { item.firstChild = start; item.lastChild = flat.length - 1; } } }; visit(tableOfContentsTree(entries));
+  const labels = makeCncxRecord(flat.map(item => item.node.label)), rows = flat.map(item => { let control = 31; const values = [rawOffsets[item.node.index] || 0, rawLengths[item.node.index] || 0, labels.offsets[item.index], Math.max(0, item.node.level - 1), item.node.index, 0]; if (item.parent != null) { control |= 32; values.push(item.parent); } if (item.firstChild != null) { control |= 64; values.push(item.firstChild); } if (item.lastChild != null) { control |= 128; values.push(item.lastChild); } return { name: String(item.index), control, values }; });
+  const tags = [[1, 1, 1, 0], [2, 1, 2, 0], [3, 1, 4, 0], [4, 1, 8, 0], [6, 2, 16, 0], [21, 1, 32, 0], [22, 1, 64, 0], [23, 1, 128, 0]];
+  return { master: makeIndexMaster(tags, 1, rows.length, 1, 1), data: makeIndexRecord(rows), cncx: labels.bytes };
+}
 function makePalmDatabase(title, records) {
   const headerSize = 78 + records.length * 8 + 2, header = new Uint8Array(headerSize), view = new DataView(header.buffer); writeAscii(header, 0, (title || "PageForge").slice(0, 31), 31); const palmTime = Math.floor(Date.now() / 1000) + 2082844800; writeU32(view, 36, palmTime); writeU32(view, 40, palmTime); writeAscii(header, 60, "BOOK"); writeAscii(header, 64, "MOBI"); writeU32(view, 68, records.length + 1); writeU16(view, 76, records.length); let offset = headerSize;
   records.forEach((record, i) => { writeU32(view, 78 + i * 8, offset); header[78 + i * 8 + 5] = (i >>> 16) & 255; header[78 + i * 8 + 6] = (i >>> 8) & 255; header[78 + i * 8 + 7] = i & 255; offset += record.length; }); return joinBytes([header, ...records]);
@@ -1047,16 +1113,15 @@ function buildAzw3(book) {
     for (const img of $$("img[src^='data:']", doc)) { const { bytes, mime } = dataUrlToBytes(img.getAttribute("src")); images.push(bytes); const id = (++imageNo).toString(36).toUpperCase().padStart(4, "0"); img.setAttribute("src", `kindle:embed:${id}?mime=${mime}`); }
     $$('style,script,iframe,object,embed,svg', doc).forEach(x => x.remove()); sections.push(wrapKf8Chapter(doc.body.innerHTML, `pf-chapter-${chapterNo + 1}`));
   }
-  const body = composeLegacyBookBody({ chapters: book.chapters, sections, filterMode: book.filterMode, tocSeparator: '<div style="page-break-after:always"></div>' });
-  const html = `<html xmlns="http://www.w3.org/1999/xhtml"><head><meta charset="utf-8"/><title>${escapeHtml(book.title)}</title></head><body>${body}</body></html>`, text = enc.encode(html), chunks = []; for (let at = 0; at < text.length; at += 4096) chunks.push(text.slice(at, at + 4096)); if (!chunks.length) chunks.push(new Uint8Array());
-  const fdstIndex = 1 + chunks.length, skelIndex = fdstIndex + 1, fragIndex = skelIndex + 2, resourceStart = fragIndex + 1;
-  const fdst = makeFdst(text.length), skelMaster = makeIndexMaster([[1, 1, 1, 0], [6, 2, 2, 0]], 1, 1), skelData = makeIndexRecord([{ name: "skel00000000", control: 3, values: [0, 0, text.length] }]), fragMaster = makeIndexMaster([[2, 1, 1, 0], [4, 1, 2, 0], [6, 2, 4, 0]], 0, 0);
+  const documents = sections.map((section, index) => enc.encode(`<html xmlns="http://www.w3.org/1999/xhtml"><head><meta charset="utf-8"/><title>${escapeHtml(chapterNavigationLabel(book.chapters[index], index))}</title></head><body>${section}</body></html>`)), rawOffsets = [], rawLengths = documents.map(bytes => bytes.length); let rawAt = 0; for (const bytes of documents) { rawOffsets.push(rawAt); rawAt += bytes.length; } const text = joinBytes(documents), chunks = []; for (let at = 0; at < text.length; at += 4096) chunks.push(text.slice(at, at + 4096)); if (!chunks.length) chunks.push(new Uint8Array());
+  const tocEntries = book.filterMode === "images" ? [] : tableOfContentsEntries(book.chapters, { autoEnabled: book.autoTocEnabled !== false }), fdstIndex = 1 + chunks.length, skelIndex = fdstIndex + 1, fragIndex = skelIndex + 2, ncxIndex = fragIndex + 3, resourceStart = ncxIndex + 3;
+  const fdst = makeFdst(text.length), skelRows = documents.map((_, index) => ({ name: `skel${String(index).padStart(8, "0")}`, control: 3, values: [1, rawOffsets[index], 0] })), skelMaster = makeIndexMaster([[1, 1, 1, 0], [6, 2, 2, 0]], 1, skelRows.length), skelData = makeIndexRecord(skelRows), emptySelector = makeCncxRecord([""]), fragRows = documents.map((_, index) => ({ name: String(rawOffsets[index]), control: 7, values: [0, index, 0, rawLengths[index]] })), fragMaster = makeIndexMaster([[2, 1, 1, 0], [4, 1, 2, 0], [6, 2, 4, 0]], 1, fragRows.length, 1, 1), fragData = makeIndexRecord(fragRows), navigation = makeKf8Navigation(tocEntries, rawOffsets, rawLengths);
   const exth = makeExth(book), titleBytes = enc.encode(book.title || "PageForge book"), record0 = new Uint8Array(264 + exth.length + titleBytes.length), view = new DataView(record0.buffer); writeU16(view, 0, 1); writeU32(view, 4, text.length); writeU16(view, 8, chunks.length); writeU16(view, 10, 4096); writeU16(view, 12, 0); writeAscii(record0, 16, "MOBI"); writeU32(view, 20, 248); writeU32(view, 24, 2); writeU32(view, 28, 65001); writeU32(view, 32, Math.floor(Date.now() / 1000)); writeU32(view, 36, 8);
-  [40, 44, 48, 52, 56, 60, 64, 68, 72, 76, 112, 116, 164, 168, 172, 176, 180, 184, 188, 200, 204, 208, 212, 216, 220, 224, 228, 232, 236, 244, 256, 260].forEach(at => writeU32(view, at, 0xffffffff)); writeU32(view, 84, 264 + exth.length); writeU32(view, 88, titleBytes.length); writeU32(view, 92, 0x00000409); writeU32(view, 104, 8); writeU32(view, 108, resourceStart); writeU32(view, 128, 0x40); writeU32(view, 192, fdstIndex); writeU32(view, 196, 1); writeU32(view, 240, 0); writeU32(view, 248, fragIndex); writeU32(view, 252, skelIndex); record0.set(exth, 264); record0.set(titleBytes, 264 + exth.length);
-  return makePalmDatabase(book.title || "PageForge", [record0, ...chunks, fdst, skelMaster, skelData, fragMaster, ...images]);
+  [40, 44, 48, 52, 56, 60, 64, 68, 72, 76, 112, 116, 164, 168, 172, 176, 180, 184, 188, 200, 204, 208, 212, 216, 220, 224, 228, 232, 236, 244, 256, 260].forEach(at => writeU32(view, at, 0xffffffff)); writeU32(view, 84, 264 + exth.length); writeU32(view, 88, titleBytes.length); writeU32(view, 92, 0x00000409); writeU32(view, 104, 8); writeU32(view, 108, resourceStart); writeU32(view, 128, 0x40); writeU32(view, 192, fdstIndex); writeU32(view, 196, 1); writeU32(view, 240, 0); writeU32(view, 244, ncxIndex); writeU32(view, 248, fragIndex); writeU32(view, 252, skelIndex); record0.set(exth, 264); record0.set(titleBytes, 264 + exth.length);
+  return makePalmDatabase(book.title || "PageForge", [record0, ...chunks, fdst, skelMaster, skelData, fragMaster, fragData, emptySelector.bytes, navigation.master, navigation.data, navigation.cncx, ...images]);
 }
 function formatBytes(size) { if (size < 1024) return `${size} B`; if (size < 1048576) return `${(size / 1024).toFixed(1)} KB`; return `${(size / 1048576).toFixed(1)} MB`; }
 
 window.addEventListener("offline", () => $("#network-proof").textContent = "Connection off · fully operational");
 if (!navigator.onLine) $("#network-proof").textContent = "Connection off · fully operational";
-window.__pageforgeTest = { parseRange, buildMobi, buildAzw3, buildEpub, filterHtml, version: "3.2" };
+window.__pageforgeTest = { analyzeChapterPages, buildAzw3, buildEpub, buildMobi, extractPdfTextLines, filterHtml, parseRange, tableOfContentsEntries, version: "3.5" };

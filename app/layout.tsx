@@ -7,15 +7,15 @@ export async function generateMetadata(): Promise<Metadata> {
   const host = requestHeaders.get("x-forwarded-host") ?? requestHeaders.get("host") ?? "localhost:3000";
   const protocol = requestHeaders.get("x-forwarded-proto") ?? (host.startsWith("localhost") ? "http" : "https");
   const metadataBase = new URL(`${protocol}://${host}`);
-  const title = "PageForge Local 3.2";
-  const description = "Private offline PDF, ebook, and photo conversion without duplicate content, synthetic headings, uploads, accounts, or external APIs.";
+  const title = "PageForge Local 3.5";
+  const description = "Private offline PDF, ebook, and photo conversion with automatic chapters 2.0, manual reader navigation, and no external APIs.";
   return {
     metadataBase,
     title,
     description,
     icons: { icon: "/favicon.png", shortcut: "/favicon.png" },
-    openGraph: { title, description, type: "website", images: [{ url: "/og-3.2.png", width: 1536, height: 1024, alt: "PageForge Local 3.2 private offline PDF, ebook, and photo converter" }] },
-    twitter: { card: "summary_large_image", title, description, images: ["/og-3.2.png"] },
+    openGraph: { title, description, type: "website", images: [{ url: "/og.png", width: 1536, height: 1024, alt: "PageForge Local 3.5 private offline PDF, ebook, and photo converter" }] },
+    twitter: { card: "summary_large_image", title, description, images: ["/og.png"] },
   };
 }
 
